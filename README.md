@@ -4,10 +4,8 @@ A Resonate SDK built on [Effect](https://effect.website), speaking the
 [Resonate protocol](https://github.com/resonatehq/resonate-protocol)
 (version `2026-04-01`) to the Resonate server.
 
-Built outside in. What exists today is the outermost layer: the protocol as
-data, the server as one method, and the engine that runs the task loop between
-them. The part that runs user code sits behind an interface and is not written
-yet.
+Built outside in: the protocol as data, the server as one method, the engine
+that runs the task loop, and the pass that runs the computation.
 
 ## The pieces
 
@@ -17,7 +15,15 @@ yet.
 | `src/requests.ts` | One constructor per request kind. Fills the head, leaves `data` to the protocol. |
 | `src/connection.ts` | The server, as one method: `send(request) -> Effect<response>`. |
 | `src/engine.ts` | The task loop: claim, execute, fulfill or suspend, continue. |
-| `src/executor.ts` | The seam where running a computation will plug in. |
+| `src/executor.ts` | The seam between the two: one pass in, completed or suspended out. |
+| `src/pass.ts` | One pass of a computation — decode, run, decide. |
+| `src/context.ts` | The durable operations, and the three guards that keep replay honest. |
+| `src/edge.ts` | The sentinel that ends a pass. |
+| `src/store.ts` | The promise store as one pass sees it: fenced writes, preloaded reads. |
+| `src/registry.ts` | Names back into code. |
+| `src/codec.ts` | Values across the wire — JSON in base64, matching the TypeScript SDK. |
+| `src/ids.ts` | The Dewey id format the server validates against. |
+| `src/retries.ts` | Retry policies, as `Schedule`s. |
 | `src/correlation.ts` | Where `head.corrId` comes from. A service, so tests can make it deterministic. |
 
 ## The engine
@@ -118,20 +124,97 @@ built with the same constructors.
 SDK's protocol version. `head.auth` is filled by the connection, which holds
 the credential.
 
+## The pass
+
+A workflow is an ordinary Effect. `ctx.run` calls a function here and records
+its result; `ctx.rpc` calls one somewhere else and awaits it.
+
+```ts
+const charge = Registry.register("charge", (ctx: Context, order: Order) =>
+  Effect.gen(function* () {
+    const total = yield* ctx.run(price, order)          // runs here, settled durably
+    const receipt = yield* ctx.rpc(payments, total)     // runs elsewhere — the edge
+    return receipt
+  }),
+)
+```
+
+Creating a promise never blocks; **awaiting** one this process cannot settle
+does. That is the whole of `executeUntilBlocked`:
+
+> A sentinel defect is thrown at the blocking await and unwinds like an
+> exception, passing through user frames untouched but inspected at every
+> Resonate frame it crosses — a frame whose subtree reached an edge refuses to
+> settle and re-raises — until it is caught once, at the root. What it does not
+> do is decide anything. The outcome comes from the **edge set**, which every
+> blocking op writes before it throws, which keeps filling after the unwind has
+> begun because sibling fibers run on to their own edges, and which outranks
+> whatever the body returned.
+
+That last clause matters: a body that returns a value while a remote child is
+still outstanding suspends anyway, exactly as in the generator engine.
+
+**Concurrency is Effect's.** `Effect.all`, `Effect.forEach`, `Effect.fork` +
+`Fiber.join`. There is no `begin` variant, because forking a `ctx.rpc` and
+joining it later already is one. Fire-and-forget `fork` with no join is the one
+shape durable execution cannot express — the parent would settle over an
+outstanding promise — so join your children.
+
+### Three guards, and why the sentinel is not one of them
+
+The sentinel is opaque to every combinator that operates on `E` — `catchAll`,
+`catchTag`, `either`, `option`, `match`, `merge`, `orElse`, `retry`, `timeout`
+— and visible to the few that operate on a `Cause` or an `Exit`:
+`catchAllCause`, `catchAllDefect`, `sandbox`, `Effect.exit`, `Fiber.await`.
+Those cannot be hidden from; that is what they are for. So nothing rests on the
+opacity. Correctness comes from three checks the SDK owns:
+
+1. **Atomic claim and create.** Minting an id and creating its promise happen in
+   one uninterruptible region, so a teardown elsewhere can never leave an id
+   naming a promise that does not exist — which `task.suspend` would answer 422.
+2. **The settle guard.** A frame whose subtree reached an edge does not record a
+   result, whatever its body returned. This is what stops a caught block from
+   writing a substituted value into a durable promise.
+3. **The prologue check.** A durable operation on a path that already reached an
+   edge is refused *before* an id is minted, so a swallowed block cannot fork
+   the id sequence and have the same id name a different call next pass.
+
+The blast radius of catching the sentinel is therefore some pure local code
+running and then stopping.
+
+### Two properties worth knowing
+
+**Creates within a frame are serialized.** Each waits for the server to answer
+the one before it, and slots in that chain are claimed synchronously where the
+call appears in the source. So `Effect.all([ctx.rpc(a), ctx.rpc(b)])` orders `a`
+before `b` by construction, not by whichever fiber the scheduler happens to
+start.
+
+**Durable frames run uninterruptible.** When one branch of a fan-out reaches its
+edge and Effect interrupts its siblings, a sibling defers that interruption,
+runs on to *its* edge, records it, and stops there — so one pass discovers every
+frontier instead of one per pass. The cost is that genuine interruption
+(shutdown, a lost lease) waits for the body to reach its next edge or finish,
+and that latency scales with the depth of the call tree. A sibling whose fiber
+has not started yet is not protected by this and is simply found next pass.
+
 ## Not yet here
 
-- **The executor.** `Executor.executeUntilBlocked` is an interface and a
-  placeholder layer. Running a computation — an Effect-native durable
-  `ctx.run`, replay against the preloaded branch, child promise creation — is
-  the next layer in.
 - **Heartbeating.** A lease has a ttl and nothing extends it yet. `task.heartbeat`
   covers every task a pid holds at once, so it belongs to a process-wide
   component beside the engine rather than inside `process`.
 - **Dispatch.** Something has to receive `execute` messages and hand them to the
   engine. `Engine.fromExecuteMsg` is the adapter; the poller/listener is not
   written.
-- **Codecs.** The engine moves protocol `Value`s and does not look inside them.
-  Encoding and decoding user values belongs with the executor.
+- **A `Resonate` front door.** Registering workflows, `run`/`rpc` from outside a
+  workflow, schedules. Everything under it exists; nothing assembles it yet.
+- **Schema-typed registration.** The codec is JSON today, so a typed `E` round
+  trips as data rather than as itself. Deriving the codec from an
+  `effect/Schema` per registered function is the natural next layer.
+- **`Effect.race` over durable operations** is not replay-deterministic — the
+  winner can differ between passes, and interrupting a `ctx.rpc` does not stop
+  the remote execution it already dispatched. Off-contract until there is a
+  durable `ctx.race` that records the winner.
 
 ## Development
 

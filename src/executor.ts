@@ -1,4 +1,5 @@
 import { Context, Data, Effect, Layer } from "effect";
+import type { ServerError, TransportError } from "./errors.js";
 import type { PromiseRecord, TaskRecord, Value } from "./protocol.js";
 
 // =============================================================================
@@ -71,14 +72,17 @@ export interface Invocation {
  * continue — and calls this for the pass itself. The Effect-native
  * implementation lands behind this interface without the engine changing.
  */
+/** What a pass can fail with: a broken run, or the server refusing a write. */
+export type ExecutorError = ExecutionError | TransportError | ServerError;
+
 export interface ExecutorService {
-  readonly executeUntilBlocked: (invocation: Invocation) => Effect.Effect<Execution, ExecutionError>;
+  readonly executeUntilBlocked: (invocation: Invocation) => Effect.Effect<Execution, ExecutorError>;
 }
 
 export class Executor extends Context.Tag("@resonatehq/effect/Executor")<Executor, ExecutorService>() {}
 
 /** Run one pass with the ambient executor. */
-export const executeUntilBlocked = (invocation: Invocation): Effect.Effect<Execution, ExecutionError, Executor> =>
+export const executeUntilBlocked = (invocation: Invocation): Effect.Effect<Execution, ExecutorError, Executor> =>
   Effect.flatMap(Executor, (executor) => executor.executeUntilBlocked(invocation));
 
 /** An executor from a bare function. */

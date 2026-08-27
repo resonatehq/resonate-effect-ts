@@ -355,23 +355,21 @@ export const make = (pass: Pass, frame: Frame): Context => {
     slot: { ready: Effect.Effect<void>; release: () => void },
     req: Effect.Effect<PromiseCreateReq, unknown>,
   ): Effect.Effect<PromiseRecord, StoreError | unknown> =>
-    Effect.uninterruptible(
-      Effect.ensuring(
-        Effect.flatMap(slot.ready, () =>
-          Effect.flatMap(FiberRef.get(caughtEdge), (caught) =>
-            caught
-              ? diverged(op)
-              : Effect.flatMap(req, (sent) =>
-                  Effect.tap(pass.store.create(sent), (record) =>
-                    // A record that came back settled is one this pass did not
-                    // create. It has to be the same call, or an id was reused.
-                    record.state === "pending" ? Effect.void : sameCall(record, sent),
-                  ),
+    Effect.ensuring(
+      Effect.flatMap(slot.ready, () =>
+        Effect.flatMap(FiberRef.get(caughtEdge), (caught) =>
+          caught
+            ? diverged(op)
+            : Effect.flatMap(req, (sent) =>
+                Effect.tap(pass.store.create(sent), (record) =>
+                  // A record that came back settled is one this pass did not
+                  // create. It has to be the same call, or an id was reused.
+                  record.state === "pending" ? Effect.void : sameCall(record, sent),
                 ),
-          ),
+              ),
         ),
-        Effect.sync(slot.release),
       ),
+      Effect.sync(slot.release),
     );
 
   const encodeParam = (func: string, args: unknown[], version: number, retry: Retries.Policy) =>

@@ -211,10 +211,14 @@ has not started yet is not protected by this and is simply found next pass.
 - **Schema-typed registration.** The codec is JSON today, so a typed `E` round
   trips as data rather than as itself. Deriving the codec from an
   `effect/Schema` per registered function is the natural next layer.
-- **`Effect.race` over durable operations** is not replay-deterministic — the
-  winner can differ between passes, and interrupting a `ctx.rpc` does not stop
-  the remote execution it already dispatched. Off-contract until there is a
-  durable `ctx.race` that records the winner.
+- **A durable `ctx.race`.** `Effect.race` over durable operations is not wrong,
+  it just does not do what you want: racing means abandoning the loser, and an
+  abandoned durable child stays in the edge set, so the pass suspends until the
+  loser settles too. A race with a winner still waits for everyone. That is the
+  same rule as fire-and-forget `fork`, not a special case — durable execution
+  cannot abandon a child, it can only *cancel* one. `ctx.race` is that: settle
+  the losers `rejected_canceled` and drop them from the edge set. The protocol
+  already has the state.
 
 ## Development
 

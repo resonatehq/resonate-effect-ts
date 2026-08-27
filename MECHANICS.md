@@ -91,6 +91,17 @@ Resonate SDK; this is how this one arranges it. Rationale lives in
    refused. Per *path* (a `FiberRef`, set on the way to an edge), not per frame —
    a sibling blocking is not this branch's problem. Runs **after** minting:
    refusing must consume the same sequence slot the real run would.
+   Its `join` is explicit: poison spreads, never clears. The default is "child
+   wins", which would unpoison a fiber the moment it joined a clean child.
+
+## Borrowed contexts
+
+- A context belongs to the invocation that made it. Using an outer one from
+  inside a deeper call advances the outer counter from a place that invocation
+  does not order, and no deterministic id exists for it.
+- Each frame records what it is executing, in a `FiberRef` whose `join` keeps the
+  parent's value. A create whose context disagrees is refused.
+- Loud, not fixed. There is no right id to mint.
 
 ## Interruptibility
 

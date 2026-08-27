@@ -287,6 +287,16 @@ export const make = (pass: Pass, frame: Frame): Context => {
       ),
     );
 
+  const foreign = (op: string, executing: string) =>
+    Effect.die(
+      new Error(
+        `ctx.${op} was called on the context of '${frame.id}' while executing '${executing}'. ` +
+          `A context belongs to the invocation that made it; using an outer one from inside a ` +
+          `deeper call advances the outer counter from a place it does not order, and the id ` +
+          `cannot be made deterministic. Use the context passed to this function.`,
+      ),
+    );
+
   const resolve = (fn: Callable, version: number): Registration | undefined =>
     typeof fn === "string" ? pass.registry.get(fn, version) : fn;
 
@@ -356,19 +366,22 @@ export const make = (pass: Pass, frame: Frame): Context => {
     req: Effect.Effect<PromiseCreateReq, unknown>,
   ): Effect.Effect<PromiseRecord, StoreError | unknown> =>
     Effect.ensuring(
-      Effect.flatMap(slot.ready, () =>
-        Effect.flatMap(FiberRef.get(caughtEdge), (caught) =>
-          caught
-            ? diverged(op)
-            : Effect.flatMap(req, (sent) =>
-                Effect.tap(pass.store.create(sent), (record) =>
-                  // A record that came back settled is one this pass did not
-                  // create. It has to be the same call, or an id was reused.
-                  record.state === "pending" ? Effect.void : sameCall(record, sent),
-                ),
-              ),
-        ),
-      ),
+      Effect.gen(function* () {
+        yield* slot.ready;
+        // This path already caught an edge, so it is running on a value this
+        // pass never produced. Refuse before anything durable happens.
+        if (yield* FiberRef.get(caughtEdge)) return yield* diverged(op);
+        // This context belongs to a different invocation than the one running.
+        const executing = yield* FiberRef.get(currentFrame);
+        if (executing !== undefined && executing !== frame.id) return yield* foreign(op, executing);
+
+        const sent = yield* req;
+        const record = yield* pass.store.create(sent);
+        // A record that came back settled is one this pass did not create. It
+        // has to be the same call, or an id was reused.
+        if (record.state !== "pending") yield* sameCall(record, sent);
+        return record;
+      }),
       Effect.sync(slot.release),
     );
 
@@ -425,7 +438,7 @@ export const make = (pass: Pass, frame: Frame): Context => {
           // during the flush records it on *this* frame, and the merge into the
           // parent has to happen after that, not before.
           return Effect.ensuring(
-            Effect.flatMap(withFlush(registered.workflow(make(pass, child), ...args)), identity),
+            Effect.flatMap(withFlush(within(id, registered.workflow(make(pass, child), ...args))), identity),
             closeFrame(child, frame),
           );
         });
@@ -506,7 +519,7 @@ export const make = (pass: Pass, frame: Frame): Context => {
         // about, and the branch ids come out in declaration order.
         const exits = yield* Effect.ensuring(
           Effect.all(
-            branches.map((branch) => withFlush(branch(inner))),
+            branches.map((branch) => withFlush(within(id, branch(inner)))),
             { concurrency: "unbounded" },
           ),
           closeFrame(arena),
@@ -739,7 +752,34 @@ const RACE = "resonate:race";
  * `catchAll(() => ctx.run(...))` while a *sibling* branch happens to be blocked
  * is doing nothing wrong, and keying the check on the frame refuses it.
  */
-const caughtEdge = FiberRef.unsafeMake(false);
+const caughtEdge = FiberRef.unsafeMake(false, {
+  // Explicit join semantics. The default is "child wins", which here would mean
+  // a poisoned fiber quietly *un*poisoning itself the moment it joined a clean
+  // child — one `Effect.all` of untainted work and the check is gone. Poison
+  // only ever spreads: a fiber that caught an edge stays caught, and one that
+  // joins a fiber which caught one has itself continued past a block.
+  join: (parent, child) => parent || child,
+});
+
+/**
+ * The frame whose body this fiber is currently executing.
+ *
+ * A `ctx` is bound to the frame that made it. Using an outer one from inside a
+ * deeper frame — capturing `ctx` and calling it from within a `ctx.run` body —
+ * mints an id against the outer frame's counter while execution belongs to the
+ * inner one. There is no deterministic id for that call: the outer counter is
+ * being advanced from a place whose ordering the outer frame does not control.
+ * So it is refused rather than named wrongly.
+ *
+ * `join: (parent) => parent` for the same reason as above, and more sharply: the
+ * default would have a frame adopt a joined child's identity, so every call
+ * after the first `Effect.all` would look foreign.
+ */
+const currentFrame = FiberRef.unsafeMake<string | undefined>(undefined, { join: (parent) => parent });
+
+/** Run `body` as the work of frame `id`. */
+export const within = <A, E, R>(id: string, body: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+  Effect.locally(body, currentFrame, id);
 
 const isOptions = (u: unknown): u is Options =>
   typeof u === "object" &&

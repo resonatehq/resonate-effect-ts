@@ -91,7 +91,10 @@ export const executeUntilBlocked = (
       frame = Ctx.rootFrame(root, registered.name, registered.version, ++attempt);
       // Same as every frame below it: the root does not finish while work it
       // spawned is still running.
-      return Effect.flatMap(Ctx.withFlush(registered.workflow(Ctx.make(pass, frame), ...param.args)), identity);
+      return Effect.flatMap(
+        Ctx.withFlush(Ctx.within(root.id, registered.workflow(Ctx.make(pass, frame), ...param.args))),
+        identity,
+      );
     });
 
     // The body gets its own fiber. It has to: the sentinel tears down every

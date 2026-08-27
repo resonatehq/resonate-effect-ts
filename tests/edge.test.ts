@@ -506,3 +506,75 @@ describe("structured concurrency reaches the whole subtree", () => {
     expect(settled).toHaveLength(depth + 1);
   }, 30_000);
 });
+
+describe("borrowed contexts and retried calls", () => {
+  const leaf = Registry.register("leaf", (_c: Context, n: number) => Effect.succeed(n * 2));
+
+  it("refuses a context borrowed from an outer invocation", async () => {
+    // `outer` belongs to the root; using it from inside the child's body would
+    // advance the root's counter from a place the root does not order.
+    const wf = Registry.register("wf", (ctx: Context) =>
+      Effect.gen(function* () {
+        const inner = Registry.register("inner", (_c: Context) => ctx.run(leaf, 1));
+        return yield* ctx.run(inner);
+      }),
+    );
+    const { effect, server: s } = run([wf, leaf], "wf");
+
+    const out = await Effect.runPromise(effect);
+
+    expect(out).toMatchObject({ _tag: "Completed", state: "rejected" });
+    const message = String((decodeValue(out) as Error).message);
+    expect(message).toContain("A context belongs to the invocation that made it");
+    // Nothing was minted against the wrong parent.
+    expect([...s.promises.keys()]).toEqual(["foo:1"]);
+  });
+
+  it("accepts the context it was handed", async () => {
+    const inner = Registry.register("inner", (c: Context) => c.run(leaf, 21));
+    const wf = Registry.register("wf", (ctx: Context) => ctx.run(inner));
+    const { effect, server: s } = run([wf, inner, leaf], "wf");
+
+    const out = await Effect.runPromise(effect);
+
+    expect(out).toMatchObject({ _tag: "Completed", state: "resolved" });
+    expect([...s.promises.keys()]).toEqual(["foo:1", "foo:1.1"]);
+  });
+
+  it("does not re-create a durable call under Effect.retry", async () => {
+    let attempts = 0;
+    const flaky = Registry.register("flaky", (_c: Context) =>
+      Effect.sync(() => ++attempts).pipe(Effect.zipRight(Effect.fail("nope"))),
+    );
+    const wf = Registry.register("wf", (ctx: Context) =>
+      ctx.run(flaky).pipe(
+        Effect.retry({ times: 4 }),
+        Effect.catchAll(() => Effect.succeed("gave up")),
+      ),
+    );
+    const { effect, server: s } = run([wf, flaky], "wf");
+
+    const out = await Effect.runPromise(effect);
+
+    expect(out).toMatchObject({ _tag: "Completed", state: "resolved" });
+    // The promise is created once and settled once. Later attempts dedup against
+    // the record and never re-run the function.
+    expect([...s.promises.keys()]).toEqual(["foo:1"]);
+    expect(s.journal.filter((e) => e.startsWith("create"))).toEqual(["create foo:1"]);
+    expect(s.journal.filter((e) => e.startsWith("settle"))).toEqual(["settle foo:1 rejected"]);
+    expect(attempts).toBe(1);
+  });
+
+  it("does not re-create a blocked call under Effect.retry", async () => {
+    const wf = Registry.register("wf", (ctx: Context) => ctx.rpc("remote").pipe(Effect.retry({ times: 5 })));
+    const { effect, server: s } = run([wf], "wf");
+
+    expect(await Effect.runPromise(effect)).toEqual({ _tag: "Suspended", awaited: ["foo:1"] });
+    expect(s.journal.filter((e) => e.startsWith("create"))).toEqual(["create foo:1"]);
+  });
+});
+
+const decodeValue = (out: unknown): unknown => {
+  const data = (out as { value?: { data?: string } }).value?.data;
+  return data ? JSON.parse(Buffer.from(data, "base64").toString("utf8")) : undefined;
+};

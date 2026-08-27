@@ -201,6 +201,34 @@ opacity. Correctness comes from three checks the SDK owns:
 The blast radius of catching the sentinel is therefore some pure local code
 running and then stopping.
 
+### Ids come from a counter, and that has a sharp edge
+
+A child's id is the next Dewey segment from a counter on its parent, taken where
+the call appears in the source. That is stable for code whose *shape* does not
+depend on timing — including every concurrent combinator, because the branches
+are constructed before any of them runs.
+
+It is not stable for a durable call built inside a callback that fires at a
+time-dependent point — a `catchAll` handler, a `forEach` body — while a
+concurrent branch shares the same counter. Replay is faster than the first run,
+since settled children come back from the record instead of doing the work, so
+those callbacks can fire in a different order and two branches can swap
+numbers. Each then reads a promise belonging to the other.
+
+Pin those calls with an explicit id:
+
+```ts
+ctx.run(failing).pipe(
+  Effect.catchAll(() => ctx.run(query, ["recovered", 400], { id: "recovered" })),
+)
+```
+
+Every dedup is checked against the call being made — the encoded parameters of
+the promise that came back must match the ones this code would have sent — so
+an id taken twice stops the pass with a diagnostic instead of quietly returning
+another branch's value. The check cannot make such a workflow correct; only the
+explicit id does that.
+
 ### Two properties worth knowing
 
 **Creates within a frame are serialized.** Each waits for the server to answer
@@ -209,9 +237,9 @@ call appears in the source. So `Effect.all([ctx.rpc(a), ctx.rpc(b)])` orders `a`
 before `b` by construction, not by whichever fiber the scheduler happens to
 start.
 
-**Durable frames run uninterruptible.** This is what stops a pass from
-abandoning work in flight. When one branch of a fan-out reaches its edge and
-Effect interrupts its siblings, a sibling defers that interruption and runs on:
+**The body runs uninterruptible.** This is what stops a pass from abandoning
+work in flight. When one branch of a fan-out reaches its edge and Effect
+interrupts its siblings, a sibling defers that interruption and runs on:
 if it is going to block, it reaches *its* edge and records it, so one pass
 discovers every frontier instead of one per pass; and if it is not blocked —
 it is halfway through a database query, an HTTP call, any ordinary Effect — it
@@ -219,6 +247,12 @@ finishes, settles its promise, and only then goes down. A `ctx.run` is never cut
 short in the middle. Anything below it that is not transitively blocked on an
 `rpc` runs to completion and is recorded, so the next pass replays it instead of
 redoing it.
+
+The whole body, not one durable frame at a time: a sibling caught *between*
+frames — in a catch handler about to start the recovery, in the code after a
+child returned — has no frame to shelter in and would be cut off there. Besides
+losing work, that shifts every id minted after it, because the next pass runs
+the operation that was skipped.
 
 The cost is that genuine interruption (shutdown, a lost lease) waits for the
 body to reach its next edge or finish, and that latency scales with the depth of

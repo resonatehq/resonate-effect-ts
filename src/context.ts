@@ -1,4 +1,4 @@
-import { Cause, Clock, Deferred, Effect, Exit, FiberId } from "effect";
+import { Cause, Clock, Deferred, Effect, Exit, FiberId, FiberRef } from "effect";
 import type { CodecService } from "./codec.js";
 import * as Edge from "./edge.js";
 import * as Ids from "./ids.js";
@@ -301,6 +301,49 @@ export const make = (pass: Pass, frame: Frame): Context => {
       record.state === "resolved" ? Effect.succeed(value) : Effect.fail(value),
     );
 
+  /**
+   * A promise that already exists must be the same call this code is making.
+   *
+   * Ids come from a counter per frame, consumed where the call appears. That is
+   * stable for code whose shape does not depend on timing — but an operation
+   * built inside a callback that fires at a time-dependent point (a `catchAll`
+   * handler, a `forEach` body) takes its number whenever that callback runs,
+   * and concurrent branches share the counter. Replay is faster than the first
+   * run, because settled children come back from the record instead of doing
+   * the work, so those callbacks can fire in a different order and two branches
+   * can swap numbers. Both then read a promise that belongs to the other, and
+   * the workflow quietly returns the wrong values.
+   *
+   * So every dedup is checked against the call being made. It cannot make such
+   * a workflow correct — only an explicit `id` does that — but it turns silent
+   * cross-wiring into something that stops and says so.
+   */
+  const sameCall = (record: PromiseRecord, sent: PromiseCreateReq): Effect.Effect<void, never> => {
+    const found = record.param?.data;
+    const expected = sent.data.param?.data;
+    if (found === undefined || found === expected) return Effect.void;
+    const describe = (v: { data?: string } | undefined) =>
+      Effect.map(Effect.either(pass.codec.decode(v)), (d) =>
+        d._tag === "Right" ? JSON.stringify(d.right) : "<undecodable>",
+      );
+    return Effect.flatMap(describe(record.param), (was) =>
+      Effect.flatMap(describe(sent.data.param), (now) =>
+        Effect.die(
+          new Error(
+            `promise '${record.id}' already exists and holds a different call.\n` +
+              `  recorded: ${was}\n  calling:  ${now}\n` +
+              `Two operations took the same id. Ids come from a counter per invocation, consumed ` +
+              `where the call appears — stable unless a durable call is built inside a callback ` +
+              `whose timing can differ between passes (a catch handler, a forEach body) while a ` +
+              `concurrent branch shares the counter. Replay is faster than the first run, so those ` +
+              `callbacks can fire in a different order and two branches swap ids. Pin it with ` +
+              `options({ id }).`,
+          ),
+        ),
+      ),
+    );
+  };
+
   // --- the durable create -------------------------------------------------
   //
   // Uninterruptible from taking the chain slot through recording the edge, so
@@ -308,12 +351,25 @@ export const make = (pass: Pass, frame: Frame): Context => {
   // its promise: the id would name a promise that does not exist, and
   // `task.suspend` would answer 422.
   const create = (
+    op: string,
     slot: { ready: Effect.Effect<void>; release: () => void },
     req: Effect.Effect<PromiseCreateReq, unknown>,
   ): Effect.Effect<PromiseRecord, StoreError | unknown> =>
     Effect.uninterruptible(
       Effect.ensuring(
-        Effect.flatMap(slot.ready, () => Effect.flatMap(req, pass.store.create)),
+        Effect.flatMap(slot.ready, () =>
+          Effect.flatMap(FiberRef.get(caughtEdge), (caught) =>
+            caught
+              ? diverged(op)
+              : Effect.flatMap(req, (sent) =>
+                  Effect.tap(pass.store.create(sent), (record) =>
+                    // A record that came back settled is one this pass did not
+                    // create. It has to be the same call, or an id was reused.
+                    record.state === "pending" ? Effect.void : sameCall(record, sent),
+                  ),
+                ),
+          ),
+        ),
         Effect.sync(slot.release),
       ),
     );
@@ -323,7 +379,6 @@ export const make = (pass: Pass, frame: Frame): Context => {
 
   // --- run: a local child, executed in this fiber -------------------------
   const run = (fn: Callable, ...rest: unknown[]): Effect.Effect<any, any> => {
-    if (frame.edges.size > 0) return diverged("run");
     const { args, opts } = split(rest);
     const o = options(opts);
     const registered = resolve(fn, o.version);
@@ -342,6 +397,7 @@ export const make = (pass: Pass, frame: Frame): Context => {
       Effect.gen(function* () {
         const now = yield* Clock.currentTimeMillis;
         const record = yield* create(
+          "run",
           slot,
           Effect.map(encodeParam(registered.name, args, registered.version, o.retry), (param) =>
             createReq({
@@ -407,7 +463,6 @@ export const make = (pass: Pass, frame: Frame): Context => {
     branches: ReadonlyArray<(ctx: Context) => Effect.Effect<any, any>>,
     opts: Options = {},
   ): Effect.Effect<any, any> => {
-    if (frame.edges.size > 0) return diverged("race");
     const o = options(opts);
     const breaks = o.id !== undefined;
     const id = breaks ? (o.id as string) : mint(frame);
@@ -417,6 +472,7 @@ export const make = (pass: Pass, frame: Frame): Context => {
       Effect.gen(function* () {
         const now = yield* Clock.currentTimeMillis;
         const record = yield* create(
+          "race",
           slot,
           Effect.map(pass.codec.encode({ func: RACE, args: [], version: 1 }), (param) =>
             createReq({
@@ -451,6 +507,10 @@ export const make = (pass: Pass, frame: Frame): Context => {
           ),
           closeFrame(arena),
         );
+
+        // Race exists to look at how its branches ended, edges included, so
+        // its own continuation is not on a caught path.
+        yield* FiberRef.set(caughtEdge, false);
 
         const won = exits.findIndex(Exit.isSuccess);
         if (won >= 0) {
@@ -492,7 +552,6 @@ export const make = (pass: Pass, frame: Frame): Context => {
       rest: unknown[],
       extra: Options = {},
     ): Effect.Effect<{ id: string; record: PromiseRecord }, any> => {
-      if (frame.edges.size > 0) return diverged(kind);
       const { args, opts } = split(rest);
       const o = options({ ...opts, ...extra });
       const registered = fn !== undefined ? resolve(fn, o.version) : undefined;
@@ -514,6 +573,7 @@ export const make = (pass: Pass, frame: Frame): Context => {
                 : yield* encodeParam(name, args, registered?.version ?? (o.version || 1), o.retry);
 
           const record = yield* create(
+            kind,
             slot,
             Effect.succeed(
               createReq({
@@ -553,7 +613,7 @@ export const make = (pass: Pass, frame: Frame): Context => {
       ? replay(record)
       : Effect.suspend(() => {
           frame.edges.add(id);
-          return Edge.reach(id);
+          return Effect.zipRight(FiberRef.set(caughtEdge, true), Edge.reach(id));
         });
 
   // One region from claiming the chain slot to recording the edge. `remote` is
@@ -605,6 +665,18 @@ const mint = (frame: Frame): string => Ids.join(frame.id, frame.seq++);
 
 /** What a race promise records as its function. It has no code behind it. */
 const RACE = "resonate:race";
+
+/**
+ * Set on the way to an edge, and read before every durable write.
+ *
+ * A fiber that reached an edge is dead, so the only way to still be executing
+ * in one is that something caught the sentinel. A `FiberRef` rather than a flag
+ * on the frame, because the frame is shared by concurrent siblings and they are
+ * not on this path: a branch that recovers from a failure with
+ * `catchAll(() => ctx.run(...))` while a *sibling* branch happens to be blocked
+ * is doing nothing wrong, and keying the check on the frame refuses it.
+ */
+const caughtEdge = FiberRef.unsafeMake(false);
 
 const isOptions = (u: unknown): u is Options =>
   typeof u === "object" &&

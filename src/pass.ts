@@ -95,7 +95,20 @@ export const executeUntilBlocked = (
     // The body gets its own fiber. It has to: the sentinel tears down every
     // frame above the edge, and if the pass shared a fiber with the body it
     // would go down with it and never read the edge set.
-    const exit = yield* Fiber.await(yield* Effect.fork(Retries.apply(body, param.retry, root.timeoutAt, now)));
+    //
+    // And the body runs uninterruptible as a whole, not merely one durable
+    // frame at a time. When a branch reaches its edge, Effect interrupts its
+    // siblings; a sibling inside a durable frame defers that and finishes, but
+    // one *between* frames — in a `catchAll` handler about to start the
+    // recovery, in the code after a child returned — has no such cover, and
+    // would be cut off there. That loses work the pass could have done, and
+    // worse, it silently shifts every id minted after it: the next pass runs
+    // the operation that was skipped, and every sibling behind it in the
+    // sequence gets a different id and a second promise. A pass ends when its
+    // work is done or blocked, never in the middle of a step.
+    const exit = yield* Fiber.await(
+      yield* Effect.fork(Effect.uninterruptible(Retries.apply(body, param.retry, root.timeoutAt, now))),
+    );
 
     // The root frame's edges decide — before the exit is even looked at.
     const edges = Ctx.edgesOf(frame);

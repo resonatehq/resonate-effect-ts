@@ -403,3 +403,60 @@ describe("a frame waits for what it spawned", () => {
     expect(await Effect.runPromise(effect)).toEqual({ _tag: "Suspended", awaited: ["foo:1.1.1"] });
   });
 });
+
+describe("a frame does not settle over a promise it created", () => {
+  // Creating a promise this process cannot settle counts from the moment it
+  // exists, not from the moment something awaits it. A frame that creates one
+  // and returns without awaiting it would otherwise finish while its child is
+  // still unresolved.
+  it("suspends on a latent promise the body never awaited", async () => {
+    const wf = Registry.register("wf", (ctx: Context) =>
+      Effect.gen(function* () {
+        yield* ctx.promise();
+        return "returned anyway";
+      }),
+    );
+    const { effect } = run([wf], "wf");
+
+    expect(await Effect.runPromise(effect)).toEqual({ _tag: "Suspended", awaited: ["foo:1"] });
+  });
+
+  it("suspends on all of them, awaited or not", async () => {
+    const wf = Registry.register("wf", (ctx: Context) =>
+      Effect.gen(function* () {
+        const first = yield* ctx.promise();
+        yield* ctx.promise();
+        return yield* first.await;
+      }),
+    );
+    const { effect } = run([wf], "wf");
+
+    expect(await Effect.runPromise(effect)).toEqual({ _tag: "Suspended", awaited: ["foo:1", "foo:2"] });
+  });
+
+  it("carries it up out of a nested frame", async () => {
+    const inner = Registry.register("inner", (c: Context) =>
+      Effect.gen(function* () {
+        yield* c.promise();
+        return "inner returned";
+      }),
+    );
+    const wf = Registry.register("wf", (ctx: Context) => ctx.run(inner));
+    const { effect, server: s } = run([wf, inner], "wf");
+
+    expect(await Effect.runPromise(effect)).toEqual({ _tag: "Suspended", awaited: ["foo:1.1"] });
+    expect(s.promises.get("foo:1")?.state).toBe("pending");
+  });
+
+  it("makes the one exception for detached, which is re-rooted so nothing waits", async () => {
+    const wf = Registry.register("wf", (ctx: Context) =>
+      Effect.gen(function* () {
+        const handle = yield* ctx.detached("background");
+        return `spawned ${handle.id}`;
+      }),
+    );
+    const { effect } = run([wf], "wf");
+
+    expect(await Effect.runPromise(effect)).toMatchObject({ _tag: "Completed", state: "resolved" });
+  });
+});

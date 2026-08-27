@@ -47,7 +47,12 @@ the list you check an implementation against.
 ## What decides
 
 - The **edge set** decides, not the sentinel. Read last, outranks the body.
-- Body returned a value with a remote child outstanding → **suspend**.
+- A promise this process cannot settle joins the set when it is **created**, not
+  when something awaits it. A frame that creates one and returns without awaiting
+  it must not settle over it.
+- `detached` is the only exception — re-rooted onto its own origin precisely so
+  nothing here waits for it.
+- Body returned a value with a child outstanding → **suspend**.
 - One `Set` per frame, merged into the parent when a frame ends, on any exit.
   Per frame because a frame must answer "did *my* subtree block" — for its settle
   guard, and for `race`, which must tell its branches from a sibling's.

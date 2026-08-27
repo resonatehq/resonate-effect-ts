@@ -599,6 +599,15 @@ export const make = (pass: Pass, frame: Frame): Context => {
             ),
           );
 
+          // A promise this frame created and cannot settle itself counts from
+          // the moment it exists, not from the moment something awaits it.
+          // Otherwise a frame that creates one and returns without awaiting it
+          // settles over a promise that is still outstanding — the parent
+          // finishes while its child is unresolved. Detached is the exception,
+          // and the only one: it is re-rooted onto its own origin precisely so
+          // that nothing here waits for it.
+          if (kind !== "detached" && record.state === "pending") frame.edges.add(id);
+
           return { id, record };
         }),
       );
@@ -616,6 +625,8 @@ export const make = (pass: Pass, frame: Frame): Context => {
     record.state !== "pending"
       ? replay(record)
       : Effect.suspend(() => {
+          // Already recorded when it was created; awaiting is what stops the
+          // fiber, and what marks this path as having reached an edge.
           frame.edges.add(id);
           return Effect.zipRight(FiberRef.set(caughtEdge, true), Edge.reach(id));
         });

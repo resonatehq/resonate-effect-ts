@@ -160,6 +160,25 @@ joining it later already is one. Fire-and-forget `fork` with no join is the one
 shape durable execution cannot express — the parent would settle over an
 outstanding promise — so join your children.
 
+`Effect.race` is the same shape, so racing gets its own operation:
+
+```ts
+yield* ctx.race([
+  (c) => c.rpc(payments, order),
+  (c) => Effect.as(c.sleep(30_000), "timed out"),
+])
+```
+
+`ctx.race` has a durable promise of its own, and the winner is written to it —
+so a later pass replays the decision rather than re-running the race. The losers
+are cancelled (`rejected_canceled`), which is what lets the pass complete:
+abandoning them would leave them in the edge set and the race would wait for
+everyone it just beat. Every branch runs, and the first *successful* one in
+declaration order wins — not the fastest, because across passes "fastest" means
+nothing. A branch either replays from a settled promise or blocks, so what
+decides a race is which promises are settled when the pass runs; declaration
+order makes that stable, and the winner record makes it permanent.
+
 ### Three guards, and why the sentinel is not one of them
 
 The sentinel is opaque to every combinator that operates on `E` — `catchAll`,
@@ -211,14 +230,10 @@ has not started yet is not protected by this and is simply found next pass.
 - **Schema-typed registration.** The codec is JSON today, so a typed `E` round
   trips as data rather than as itself. Deriving the codec from an
   `effect/Schema` per registered function is the natural next layer.
-- **A durable `ctx.race`.** `Effect.race` over durable operations is not wrong,
-  it just does not do what you want: racing means abandoning the loser, and an
-  abandoned durable child stays in the edge set, so the pass suspends until the
-  loser settles too. A race with a winner still waits for everyone. That is the
-  same rule as fire-and-forget `fork`, not a special case — durable execution
-  cannot abandon a child, it can only *cancel* one. `ctx.race` is that: settle
-  the losers `rejected_canceled` and drop them from the edge set. The protocol
-  already has the state.
+- **Cancelling deeper than the edge.** `ctx.race` cancels the promises its
+  losing branches were blocked on. A losing branch that blocked *below* a local
+  child leaves that intermediate promise pending until it times out — inert,
+  since nothing is running it, but untidy.
 
 ## Development
 

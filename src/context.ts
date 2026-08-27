@@ -1,4 +1,4 @@
-import { Cause, Clock, Deferred, Effect, Exit, FiberId, HashSet, Ref } from "effect";
+import { Cause, Clock, Deferred, Effect, Exit, FiberId } from "effect";
 import type { CodecService } from "./codec.js";
 import * as Edge from "./edge.js";
 import * as Ids from "./ids.js";
@@ -87,6 +87,33 @@ export interface Context extends Info {
   rpc<A = unknown, E = unknown>(fn: string, ...args: unknown[]): Effect.Effect<A, E>;
   rpc<A = unknown, E = unknown>(fn: Callable, args: unknown[], opts: Options): Effect.Effect<A, E>;
 
+  /**
+   * Race durable branches and record who won.
+   *
+   * The winner is written to this operation's own durable promise, so a later
+   * pass replays the decision instead of re-running the race — which is what
+   * makes racing durable work replay-safe at all. The losers are cancelled
+   * (`rejected_canceled`), so nothing is left outstanding and the pass is free
+   * to complete; the classic use is racing a call against a durable timeout:
+   *
+   * ```ts
+   * yield* ctx.race([
+   *   (c) => c.rpc(payments, order),
+   *   (c) => Effect.as(c.sleep(30_000), "timed out"),
+   * ])
+   * ```
+   *
+   * Every branch runs, and the first *successful* one in declaration order
+   * wins. Not the fastest: across passes "fastest" means nothing, because a
+   * branch either replays from a settled promise or blocks, so what decides a
+   * race is which promises are settled when the pass runs. Declaration order
+   * makes that stable, and the winner record makes it permanent.
+   */
+  race<A, E = never>(
+    branches: ReadonlyArray<(ctx: Context) => Effect.Effect<A, E>>,
+    opts?: Options,
+  ): Effect.Effect<A, E>;
+
   /** Sleep durably. The wake is a deadline the server owns, not a timer here. */
   sleep(ms: number): Effect.Effect<void>;
 
@@ -110,11 +137,19 @@ export interface Context extends Info {
 // user frames, every level of the durable tree has a place to keep this and a
 // place to check it.
 
-interface Frame extends Info {
+export interface Frame extends Info {
   /** The next Dewey segment to hand out. */
   seq: number;
-  /** This frame's subtree reached an edge. Set by an op, read at the settle. */
-  blocked: boolean;
+  /**
+   * Every promise this frame's subtree is blocked on. A plain Set: frames are
+   * mutated only from the fibers under them and JavaScript runs one at a time.
+   *
+   * Per frame rather than per pass, because the frame is what has to answer
+   * "did *my* subtree block" — at the settle guard, and for `race`, which needs
+   * to tell its own branches' edges from a concurrent sibling's. The root
+   * frame's set is the pass's answer.
+   */
+  readonly edges: Set<string>;
   /** Tail of the creation chain — see `claim`. */
   tail: Effect.Effect<void>;
   /** Every gate claimed here, released when the frame ends. */
@@ -123,8 +158,6 @@ interface Frame extends Info {
 
 /** What every frame in one pass shares. */
 export interface Pass {
-  /** Every promise this pass is blocked on. The pass decides on this, last. */
-  readonly edges: Ref.Ref<HashSet.HashSet<string>>;
   readonly store: StoreService;
   readonly registry: RegistryService;
   readonly codec: CodecService;
@@ -144,7 +177,7 @@ export const rootFrame = (promise: PromiseRecord, func: string, version: number,
   version,
   func,
   seq: Ids.FIRST_SEGMENT,
-  blocked: false,
+  edges: new Set(),
   tail: Effect.void,
   gates: [],
 });
@@ -166,10 +199,13 @@ const childFrame = (
   version,
   func,
   seq: Ids.FIRST_SEGMENT,
-  blocked: false,
+  edges: new Set(),
   tail: Effect.void,
   gates: [],
 });
+
+/** The pass's answer, once the root frame is done. */
+export const edgesOf = (frame: Frame): ReadonlyArray<string> => [...frame.edges].sort();
 
 // =============================================================================
 // THE CREATION CHAIN
@@ -197,10 +233,16 @@ const claim = (frame: Frame): { ready: Effect.Effect<void>; release: () => void 
   return { ready, release };
 };
 
-const closeFrame = (frame: Frame) =>
+/**
+ * Ending a frame releases every chain slot it handed out — one claimed by an
+ * operation that never ran would stall the rest — and hands its edges to its
+ * parent, so a block anywhere below surfaces at every settle above it.
+ */
+const closeFrame = (frame: Frame, parent?: Frame) =>
   Effect.sync(() => {
     for (const release of frame.gates) release();
     frame.gates.length = 0;
+    if (parent) for (const id of frame.edges) parent.edges.add(id);
   });
 
 // =============================================================================
@@ -281,7 +323,7 @@ export const make = (pass: Pass, frame: Frame): Context => {
 
   // --- run: a local child, executed in this fiber -------------------------
   const run = (fn: Callable, ...rest: unknown[]): Effect.Effect<any, any> => {
-    if (frame.blocked) return diverged("run");
+    if (frame.edges.size > 0) return diverged("run");
     const { args, opts } = split(rest);
     const o = options(opts);
     const registered = resolve(fn, o.version);
@@ -325,7 +367,7 @@ export const make = (pass: Pass, frame: Frame): Context => {
         let attempt = 0;
         const body = Effect.suspend(() => {
           child = childFrame(frame, id, record, registered.name, registered.version, ++attempt);
-          return Effect.ensuring(registered.workflow(make(pass, child), ...args), closeFrame(child));
+          return Effect.ensuring(registered.workflow(make(pass, child), ...args), closeFrame(child, frame));
         });
 
         const exit = yield* Effect.exit(Retries.apply(body, o.retry, record.timeoutAt, now));
@@ -337,15 +379,9 @@ export const make = (pass: Pass, frame: Frame): Context => {
         // here may have caught it.
         if (Exit.isFailure(exit)) {
           const edge = Edge.first(exit.cause);
-          if (edge) {
-            frame.blocked = true;
-            return yield* Edge.reraise(edge);
-          }
+          if (edge) return yield* Edge.reraise(edge);
         }
-        if (child.blocked) {
-          frame.blocked = true;
-          return yield* Edge.reach(id);
-        }
+        if (child.edges.size > 0) return yield* Edge.reach(id);
 
         if (Exit.isSuccess(exit)) {
           yield* settle(id, "resolved", exit.value);
@@ -361,10 +397,92 @@ export const make = (pass: Pass, frame: Frame): Context => {
     );
   };
 
-  const settle = (id: string, state: "resolved" | "rejected", value: unknown) =>
+  const settle = (id: string, state: "resolved" | "rejected" | "rejected_canceled", value: unknown) =>
     Effect.flatMap(pass.codec.encode(value), (encoded) =>
       pass.store.settle({ kind: "promise.settle", head: head(), data: { id, state, value: encoded } }),
     );
+
+  // --- race: a local frame whose promise records the winner ----------------
+  const race = (
+    branches: ReadonlyArray<(ctx: Context) => Effect.Effect<any, any>>,
+    opts: Options = {},
+  ): Effect.Effect<any, any> => {
+    if (frame.edges.size > 0) return diverged("race");
+    const o = options(opts);
+    const breaks = o.id !== undefined;
+    const id = breaks ? (o.id as string) : mint(frame);
+    const slot = claim(frame);
+
+    return Effect.uninterruptible(
+      Effect.gen(function* () {
+        const now = yield* Clock.currentTimeMillis;
+        const record = yield* create(
+          slot,
+          Effect.map(pass.codec.encode({ func: RACE, args: [], version: 1 }), (param) =>
+            createReq({
+              id,
+              timeoutAt: Math.min(now + o.timeout, frame.timeoutAt),
+              param,
+              tags: {
+                "resonate:scope": "local",
+                "resonate:branch": breaks ? id : frame.branchId,
+                "resonate:parent": breaks ? id : frame.id,
+                "resonate:origin": breaks ? id : frame.originId,
+                ...o.tags,
+              },
+            }),
+          ),
+        );
+
+        // The decision, already made and recorded. The branches are not built,
+        // let alone run: replay never re-races.
+        if (record.state !== "pending") return yield* replay(record);
+
+        const arena = childFrame(frame, id, record, RACE, 1, 1);
+        const inner = make(pass, arena);
+
+        // Every branch runs to its own end — a value, a typed failure, or its
+        // edge. Nothing is interrupted, so there are no torn creates to reason
+        // about, and the branch ids come out in declaration order.
+        const exits = yield* Effect.ensuring(
+          Effect.all(
+            branches.map((branch) => Effect.exit(branch(inner))),
+            { concurrency: "unbounded" },
+          ),
+          closeFrame(arena),
+        );
+
+        const won = exits.findIndex(Exit.isSuccess);
+        if (won >= 0) {
+          // Everything the arena is blocked on belongs to a branch that lost:
+          // a branch that produced a value never blocked. Cancel them, so the
+          // pass is not left waiting on work whose answer nobody wants.
+          for (const loser of arena.edges) yield* settle(loser, "rejected_canceled", undefined);
+          arena.edges.clear();
+          const value = (exits[won] as Exit.Success<any, never>).value;
+          yield* settle(id, "resolved", value);
+          return value;
+        }
+
+        // No winner yet. If any branch is still outstanding the race is not
+        // decided, so nothing is recorded — the pass suspends on all of them
+        // and comes back when any one settles.
+        for (const edge of arena.edges) frame.edges.add(edge);
+        if (arena.edges.size > 0) return yield* Edge.reach(id);
+
+        const interrupted = exits.find((e) => Exit.isFailure(e) && Cause.isInterruptedOnly(e.cause));
+        if (interrupted) return yield* Effect.failCause((interrupted as Exit.Failure<never, never>).cause);
+
+        // Every branch failed: the race failed. First failure by declaration
+        // order, so the recorded rejection is the same on every run.
+        const first = exits[0] as Exit.Failure<never, unknown>;
+        const failure = Cause.failureOption(first.cause);
+        const error = failure._tag === "Some" ? failure.value : squash(first.cause);
+        yield* settle(id, "rejected", error);
+        return yield* Effect.fail(error);
+      }),
+    );
+  };
 
   // --- rpc: someone else runs it ------------------------------------------
   const remote =
@@ -374,7 +492,7 @@ export const make = (pass: Pass, frame: Frame): Context => {
       rest: unknown[],
       extra: Options = {},
     ): Effect.Effect<{ id: string; record: PromiseRecord }, any> => {
-      if (frame.blocked) return diverged(kind);
+      if (frame.edges.size > 0) return diverged(kind);
       const { args, opts } = split(rest);
       const o = options({ ...opts, ...extra });
       const registered = fn !== undefined ? resolve(fn, o.version) : undefined;
@@ -433,10 +551,9 @@ export const make = (pass: Pass, frame: Frame): Context => {
   const awaitRemote = (id: string, record: PromiseRecord): Effect.Effect<any, any> =>
     record.state !== "pending"
       ? replay(record)
-      : Effect.gen(function* () {
-          yield* Ref.update(pass.edges, HashSet.add(id));
-          frame.blocked = true;
-          return yield* Edge.reach(id);
+      : Effect.suspend(() => {
+          frame.edges.add(id);
+          return Edge.reach(id);
         });
 
   // One region from claiming the chain slot to recording the edge. `remote` is
@@ -475,6 +592,7 @@ export const make = (pass: Pass, frame: Frame): Context => {
     func: frame.func,
     run,
     rpc,
+    race,
     sleep,
     promise,
     detached,
@@ -484,6 +602,9 @@ export const make = (pass: Pass, frame: Frame): Context => {
 
 // The Dewey segment for the next child, consumed in source order.
 const mint = (frame: Frame): string => Ids.join(frame.id, frame.seq++);
+
+/** What a race promise records as its function. It has no code behind it. */
+const RACE = "resonate:race";
 
 const isOptions = (u: unknown): u is Options =>
   typeof u === "object" &&

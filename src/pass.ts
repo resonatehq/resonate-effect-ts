@@ -1,4 +1,4 @@
-import { Cause, Clock, Effect, Exit, Fiber, HashSet, Layer, Ref } from "effect";
+import { Cause, Clock, Effect, Exit, Fiber, Layer } from "effect";
 import { Codec, type CodecService } from "./codec.js";
 import type { Connection } from "./connection.js";
 import * as Ctx from "./context.js";
@@ -74,7 +74,6 @@ export const executeUntilBlocked = (
     }
 
     const pass: Ctx.Pass = {
-      edges: yield* Ref.make(HashSet.empty<string>()),
       store: yield* Store.make({ id: invocation.task.id, version: invocation.task.version }, invocation.preload),
       registry,
       codec,
@@ -87,8 +86,9 @@ export const executeUntilBlocked = (
     // A fresh frame per attempt, so a retried body replays its children onto
     // the same ids and dedups.
     let attempt = 0;
+    let frame!: Ctx.Frame;
     const body = Effect.suspend(() => {
-      const frame = Ctx.rootFrame(root, registered.name, registered.version, ++attempt);
+      frame = Ctx.rootFrame(root, registered.name, registered.version, ++attempt);
       return registered.workflow(Ctx.make(pass, frame), ...param.args);
     });
 
@@ -97,11 +97,9 @@ export const executeUntilBlocked = (
     // would go down with it and never read the edge set.
     const exit = yield* Fiber.await(yield* Effect.fork(Retries.apply(body, param.retry, root.timeoutAt, now)));
 
-    // The edge set decides — before the exit is even looked at. Sorted, because
-    // a set does not iterate in insertion order and a pass should report the
-    // same thing twice given the same run.
-    const edges = yield* Ref.get(pass.edges);
-    if (HashSet.size(edges) > 0) return suspended([...edges].sort());
+    // The root frame's edges decide — before the exit is even looked at.
+    const edges = Ctx.edgesOf(frame);
+    if (edges.length > 0) return suspended(edges);
 
     if (Exit.isSuccess(exit)) {
       return completed(root.id, "resolved", yield* codec.encode(exit.value));

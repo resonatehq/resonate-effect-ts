@@ -40,6 +40,9 @@
         "rules": {
           "suspicious": {
             "noExplicitAny": "off"
+          },
+          "complexity": {
+            "noExcessiveCognitiveComplexity": "off"
           }
         }
       }

@@ -138,8 +138,12 @@ export interface Context extends Info {
 // place to check it.
 
 export interface Frame extends Info {
-  /** The next Dewey segment to hand out. */
-  seq: number;
+  /**
+   * The next Dewey segment to hand out, in a cell rather than a field so that a
+   * frame can be copied to give it a separate edge set — as `race` does per
+   * branch — while every copy still mints from one sequence.
+   */
+  readonly counter: { n: number };
   /**
    * Every promise this frame's subtree is blocked on. A plain Set: frames are
    * mutated only from the fibers under them and JavaScript runs one at a time.
@@ -176,7 +180,7 @@ export const rootFrame = (promise: PromiseRecord, func: string, version: number,
   attempt,
   version,
   func,
-  seq: Ids.FIRST_SEGMENT,
+  counter: { n: Ids.FIRST_SEGMENT },
   edges: new Set(),
   tail: Effect.void,
   gates: [],
@@ -198,7 +202,7 @@ const childFrame = (
   attempt,
   version,
   func,
-  seq: Ids.FIRST_SEGMENT,
+  counter: { n: Ids.FIRST_SEGMENT },
   edges: new Set(),
   tail: Effect.void,
   gates: [],
@@ -501,6 +505,12 @@ export const make = (pass: Pass, frame: Frame): Context => {
     opts: Options = {},
   ): Effect.Effect<any, any> => {
     const o = options(opts);
+    // Checked before anything is minted or created: a race with no branches can
+    // never be decided, so creating its promise would leave one pending that
+    // nothing will ever settle.
+    if (branches.length === 0) {
+      return Effect.die(new Error("ctx.race was given no branches; there is nothing to race"));
+    }
     const breaks = o.id !== undefined;
     const invalid = breaks ? Ids.validateRoot(o.id as string) : undefined;
     if (invalid) return Effect.die(invalid);
@@ -534,22 +544,25 @@ export const make = (pass: Pass, frame: Frame): Context => {
         if (record.state !== "pending") return yield* replay(record);
 
         const arena = childFrame(frame, id, record, RACE, 1, 1);
-        const inner = make(pass, arena);
+        // One sub-frame per branch, sharing the arena's id space but keeping
+        // its own edge set. Without that there is no way to tell whose edges
+        // are whose: a branch that blocked and then caught its own sentinel
+        // produces a successful exit, so it would win the race while its own
+        // outstanding promise was cancelled as somebody else's loser.
+        // Each branch keeps its own edge set but mints from the arena's one
+        // sequence, so branch ids are exactly what a single arena would give.
+        const arenas = branches.map((branch) => ({ branch, frame: { ...arena, edges: new Set<string>() } }));
 
         // Every branch runs to its own end — a value, a typed failure, or its
         // edge. Nothing is interrupted, so there are no torn creates to reason
         // about, and the branch ids come out in declaration order.
-        if (branches.length === 0) {
-          return yield* Effect.die(new Error(`ctx.race at '${id}' was given no branches; there is nothing to race`));
-        }
-
         // Race looks at how its branches ended, edges included, so its own
         // continuation is not on a caught path — but only its own. Scoped, or
         // it would disable the divergence check for the rest of the frame.
         const exits = yield* Effect.locally(
           Effect.ensuring(
             Effect.all(
-              branches.map((branch) => withFlush(within(id, branch(inner)))),
+              arenas.map(({ branch, frame: branchFrame }) => withFlush(within(id, branch(make(pass, branchFrame))))),
               { concurrency: "unbounded" },
             ),
             closeFrame(arena),
@@ -558,12 +571,20 @@ export const make = (pass: Pass, frame: Frame): Context => {
           false,
         );
 
-        const won = exits.findIndex(Exit.isSuccess);
+        // A winner is a branch that produced a value AND is not itself blocked.
+        // Producing a value is not enough: a branch that reached its edge and
+        // then caught the sentinel also produces one, and its answer is a
+        // fabrication.
+        const won = exits.findIndex((exit, i) => Exit.isSuccess(exit) && (arenas[i]?.frame.edges.size ?? 0) === 0);
         if (won >= 0) {
-          // Everything the arena is blocked on belongs to a branch that lost:
-          // a branch that produced a value never blocked. Cancel them, so the
-          // pass is not left waiting on work whose answer nobody wants.
-          for (const loser of arena.edges) yield* settle(loser, "rejected_canceled", undefined);
+          // Only the other branches' edges are losers'. The winner has none by
+          // construction, and cancelling a promise the winner created would
+          // kill work its own result depends on.
+          for (const [i, losing] of arenas.entries()) {
+            if (i === won) continue;
+            for (const loser of losing.frame.edges) yield* settle(loser, "rejected_canceled", undefined);
+            losing.frame.edges.clear();
+          }
           arena.edges.clear();
           const value = (exits[won] as Exit.Success<any, never>).value;
           yield* settle(id, "resolved", value);
@@ -573,8 +594,14 @@ export const make = (pass: Pass, frame: Frame): Context => {
         // No winner yet. If any branch is still outstanding the race is not
         // decided, so nothing is recorded — the pass suspends on all of them
         // and comes back when any one settles.
-        for (const edge of arena.edges) frame.edges.add(edge);
-        if (arena.edges.size > 0) return yield* Edge.reach(id);
+        let outstanding = 0;
+        for (const a of [...arenas.map((x) => x.frame), arena]) {
+          for (const edge of a.edges) {
+            frame.edges.add(edge);
+            outstanding++;
+          }
+        }
+        if (outstanding > 0) return yield* Edge.reach(id);
 
         const interrupted = exits.find((e) => Exit.isFailure(e) && Cause.isInterruptedOnly(e.cause));
         if (interrupted) return yield* Effect.failCause((interrupted as Exit.Failure<never, never>).cause);
@@ -720,7 +747,7 @@ export const make = (pass: Pass, frame: Frame): Context => {
 };
 
 // The Dewey segment for the next child, consumed in source order.
-const mint = (frame: Frame): string => Ids.join(frame.id, frame.seq++);
+const mint = (frame: Frame): string => Ids.join(frame.id, frame.counter.n++);
 
 /**
  * A frame does not finish while work it spawned is still running.

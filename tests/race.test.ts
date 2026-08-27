@@ -21,6 +21,7 @@ const go = (
   wf: Registry.Registration,
   seed: PromiseRecord[] = [],
   latency?: (id: string) => number,
+  extra: Registry.Registration[] = [],
   preload: PromiseRecord[] = [],
 ) => {
   const s = server({ latency });
@@ -28,7 +29,7 @@ const go = (
   const effect = Pass.executeUntilBlocked(
     { task: task(), promise: root(wf.name), preload },
     { target: "poll://worker" },
-  ).pipe(Effect.provide(Layer.mergeAll(s.layer, Codec.layerJson, Registry.layer([wf]))));
+  ).pipe(Effect.provide(Layer.mergeAll(s.layer, Codec.layerJson, Registry.layer([wf, ...extra]))));
   return { server: s, effect };
 };
 
@@ -97,7 +98,7 @@ describe("ctx.race", () => {
     // The race promise shares the root's branch, so a resuming pass gets it
     // back with the claim and pays nothing at all to replay the decision.
     const decided = { ...settled("foo:1", "already decided"), tags: { "resonate:branch": "foo" } };
-    const { effect, server: s } = go(racer, [decided], undefined, [decided]);
+    const { effect, server: s } = go(racer, [decided], undefined, [], [decided]);
 
     const out = await Effect.runPromise(effect);
 
@@ -141,5 +142,49 @@ describe("ctx.race", () => {
     // The second branch might still win once it settles, so nothing is decided.
     expect(await Effect.runPromise(effect)).toEqual({ _tag: "Suspended", awaited: ["foo:1.1"] });
     expect(s.promises.get("foo:1")?.state).toBe("pending");
+  });
+});
+
+describe("a race decides on what a branch actually did", () => {
+  const blocked = Registry.register("blocked", (c: Context) => c.rpc("never-answers"));
+
+  it("does not let a branch win by catching its own block", async () => {
+    // The branch reaches its edge, swallows the sentinel, and returns a value.
+    // A successful exit is not enough to win: this branch is blocked, and its
+    // answer is a fabrication.
+    const cheat = Registry.register("cheat", (ctx: Context) =>
+      ctx.race([
+        (c) => c.run(blocked).pipe(Effect.catchAllCause(() => Effect.succeed("FABRICATED"))),
+        (c) => c.rpc("real"),
+      ]),
+    );
+    const { effect, server: s } = go(cheat, [], undefined, [blocked]);
+
+    const out = await Effect.runPromise(effect);
+
+    // Undecided: both branches are outstanding, so nothing is recorded.
+    expect(out._tag).toBe("Suspended");
+    expect(s.promises.get("foo:1")?.state).toBe("pending");
+    expect([...s.promises.values()].some((p) => p.state === "rejected_canceled")).toBe(false);
+  });
+
+  it("cancels only the losing branch's promises, never the winner's", async () => {
+    // The winning branch also creates a promise of its own. Cancelling it would
+    // kill work the winner's own result depends on.
+    const winner = Registry.register("winner", (c: Context) =>
+      Effect.gen(function* () {
+        yield* c.promise({ id: "winner-side-channel" });
+        return "WON";
+      }),
+    );
+    const wf = Registry.register("wf", (ctx: Context) => ctx.race([(c) => c.run(winner), (c) => c.rpc("loser")]));
+    const { effect, server: s } = go(wf, [], undefined, [winner]);
+
+    const out = await Effect.runPromise(effect);
+
+    // The winner created a promise it never awaited, so the race is not
+    // decided — but nothing of the winner's was cancelled either.
+    expect(s.promises.get("winner-side-channel")?.state).not.toBe("rejected_canceled");
+    void out;
   });
 });

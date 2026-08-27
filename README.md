@@ -7,8 +7,9 @@ A Resonate SDK built on [Effect](https://effect.website), speaking the
 Built outside in: the protocol as data, the server as one method, the engine
 that runs the task loop, and the pass that runs the computation.
 
-See [MECHANICS.md](MECHANICS.md) for the moving parts stated flat — the list to
-check an implementation against. This file carries the reasoning.
+[ART.md](ART.md) is the laws any Resonate SDK has to satisfy, in no particular
+language. [MECHANICS.md](MECHANICS.md) is how this one satisfies them, stated
+flat. This file carries the reasoning.
 
 ## The pieces
 

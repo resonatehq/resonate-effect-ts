@@ -1,7 +1,8 @@
 # Mechanics
 
-The moving parts, stated flat. Rationale lives in [README](README.md); this is
-the list you check an implementation against.
+The moving parts, stated flat. [ART.md](ART.md) is what has to be true of any
+Resonate SDK; this is how this one arranges it. Rationale lives in
+[README](README.md).
 
 ## Task loop
 

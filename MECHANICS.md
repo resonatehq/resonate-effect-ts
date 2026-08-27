@@ -67,10 +67,13 @@ the list you check an implementation against.
   combinator — nothing else waits for it.
 - So each frame flushes: after the body, await the fibers *it* added. Not ones
   the caller already had running, or a frame could wait on a sibling waiting on it.
-- The flush walks the **whole subtree**, and loops until nothing new appears.
-  Effect does not cascade — awaiting a fiber returns as soon as that fiber is
-  done and leaves its own unjoined children running — so a fork nested inside a
-  fork is reachable only by walking down.
+- Direct children only. They cover their own subtrees by induction — but only
+  because the body is uninterruptible. Awaiting a fiber does not normally wait
+  for its children; inside an uninterruptible region it does, because a
+  completing fiber interrupts its children and waits for that to land, and
+  deferred interruption turns "interrupt and wait" into "wait until they
+  finish". Coupled: make the body interruptible and this stops reaching past
+  one level.
 - The flush runs inside the frame, before its edges merge upward — a fork that
   reaches its edge during the flush records it on that frame.
 - Without it a frame settles over a child still in flight, and a remote one is

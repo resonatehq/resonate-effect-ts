@@ -48,3 +48,38 @@ export const of = (cause: Cause.Cause<unknown>): ReadonlyArray<Edge> => [...Caus
 
 /** The first edge named by a cause. */
 export const first = (cause: Cause.Cause<unknown>): Edge | undefined => of(cause)[0];
+
+// =============================================================================
+// UNAVAILABLE
+// =============================================================================
+//
+// The other thing that can stop a pass, and the one that must never be mistaken
+// for a result.
+//
+// A failed write — a rate limit, a timeout, a 500, a lost connection — says
+// nothing about the computation. It has not failed; it has not been run. If
+// such a failure reaches the workflow's error channel it becomes
+// indistinguishable from a domain error: the user's `catchAll` swallows a 429
+// as a business failure and durably records the compensation, or it reaches the
+// root and gets written as the workflow's permanent result. Neither is
+// recoverable — a fulfilled task is immutable.
+//
+// So it travels as a defect, like an edge, and the pass answers it by giving
+// the lease back rather than by recording anything. The next delivery tries
+// again.
+
+export class Unavailable extends Data.TaggedClass("ResonateUnavailable")<{
+  readonly cause: unknown;
+}> {}
+
+const UNAVAILABLE_TAG = "ResonateUnavailable";
+
+export const isUnavailable = (u: unknown): u is Unavailable =>
+  typeof u === "object" && u !== null && (u as { _tag?: unknown })._tag === UNAVAILABLE_TAG;
+
+/** The server could not be told. Never a result. */
+export const unavailable = (cause: unknown): Effect.Effect<never> => Effect.die(new Unavailable({ cause }));
+
+/** The first unavailability named by a cause, if any. */
+export const firstUnavailable = (cause: Cause.Cause<unknown>): Unavailable | undefined =>
+  [...Cause.defects(cause)].filter(isUnavailable)[0];

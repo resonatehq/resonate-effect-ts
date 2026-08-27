@@ -30,7 +30,9 @@ export interface Server {
   readonly settleExternally: (id: string, value: unknown) => void;
 }
 
-export const server = (opts: { latency?: (id: string) => number } = {}): Server => {
+export const server = (
+  opts: { latency?: (id: string) => number; refuse?: (req: Request, nth: number) => number | undefined } = {},
+): Server => {
   const promises = new Map<string, PromiseRecord>();
   const journal: string[] = [];
   const latency = opts.latency ?? (() => 0);
@@ -78,6 +80,8 @@ export const server = (opts: { latency?: (id: string) => number } = {}): Server 
   const send = (req: Request): Effect.Effect<Response, never> =>
     Effect.gen(function* () {
       kinds.push(req.kind);
+      const refused = opts.refuse?.(req, kinds.length);
+      if (refused !== undefined) return ok(req, `refused with ${refused}`, refused);
 
       if (req.kind === "task.acquire") {
         const promise = promises.get(req.data.id);

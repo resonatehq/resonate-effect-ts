@@ -265,7 +265,10 @@ export const make = (pass: Pass, frame: Frame): Context => {
   const options = (opts: Options = {}) => ({
     target: opts.target ?? pass.target,
     timeout: opts.timeout ?? DAY,
-    tags: opts.tags ?? {},
+    // The `resonate:` namespace is the protocol's, not the caller's: a user tag
+    // overwriting `resonate:branch` or `resonate:origin` puts an id on the wire
+    // that the server's own validation rejects.
+    tags: Object.fromEntries(Object.entries(opts.tags ?? {}).filter(([k]) => !k.startsWith("resonate:"))),
     version: opts.version ?? 0,
     retry: opts.retry ?? Retries.never,
     id: opts.id,
@@ -300,11 +303,18 @@ export const make = (pass: Pass, frame: Frame): Context => {
   const resolve = (fn: Callable, version: number): Registration | undefined =>
     typeof fn === "string" ? pass.registry.get(fn, version) : fn;
 
-  // Split `(fn, ...args)` from `(fn, args, opts)`.
-  const split = (rest: unknown[]): { args: unknown[]; opts: Options } =>
-    rest.length === 2 && Array.isArray(rest[0]) && isOptions(rest[1])
-      ? { args: rest[0] as unknown[], opts: rest[1] as Options }
-      : { args: rest, opts: {} };
+  // Split `(fn, ...args)` from `(fn, args, opts)`. A trailing options object is
+  // also honoured on its own, which is how the no-argument operations —
+  // `promise`, `detached` — carry one.
+  const split = (rest: unknown[]): { args: unknown[]; opts: Options } => {
+    if (rest.length === 2 && Array.isArray(rest[0]) && isOptions(rest[1])) {
+      return { args: rest[0] as unknown[], opts: rest[1] as Options };
+    }
+    if (rest.length > 0 && isOptions(rest[rest.length - 1])) {
+      return { args: rest.slice(0, -1), opts: rest[rest.length - 1] as Options };
+    }
+    return { args: rest, opts: {} };
+  };
 
   const replay = (record: PromiseRecord): Effect.Effect<any, any> =>
     Effect.flatMap(pass.codec.decode(record.value), (value) =>
@@ -376,7 +386,7 @@ export const make = (pass: Pass, frame: Frame): Context => {
         if (executing !== undefined && executing !== frame.id) return yield* foreign(op, executing);
 
         const sent = yield* req;
-        const record = yield* pass.store.create(sent);
+        const record = yield* Effect.catchAll(pass.store.create(sent), Edge.unavailable);
         // A record that came back settled is one this pass did not create. It
         // has to be the same call, or an id was reused.
         if (record.state !== "pending") yield* sameCall(record, sent);
@@ -397,6 +407,8 @@ export const make = (pass: Pass, frame: Frame): Context => {
       return Effect.die(new Error(`function '${typeof fn === "string" ? fn : fn.name}' is not registered`));
     }
     const breaks = o.id !== undefined;
+    const invalid = breaks ? Ids.validateRoot(o.id as string) : undefined;
+    if (invalid) return Effect.die(invalid);
     const id = breaks ? (o.id as string) : mint(frame);
     const slot = claim(frame);
 
@@ -453,6 +465,9 @@ export const make = (pass: Pass, frame: Frame): Context => {
         if (Exit.isFailure(exit)) {
           const edge = Edge.first(exit.cause);
           if (edge) return yield* Edge.reraise(edge);
+          // The subtree could not talk to the server. Nothing is known about
+          // this call, so nothing is recorded for it.
+          if (Edge.firstUnavailable(exit.cause)) return yield* Effect.failCause(exit.cause);
         }
         if (child.edges.size > 0) return yield* Edge.reach(id);
 
@@ -472,8 +487,13 @@ export const make = (pass: Pass, frame: Frame): Context => {
 
   const settle = (id: string, state: "resolved" | "rejected" | "rejected_canceled", value: unknown) =>
     Effect.flatMap(pass.codec.encode(value), (encoded) =>
-      pass.store.settle({ kind: "promise.settle", head: head(), data: { id, state, value: encoded } }),
-    );
+      // A write that did not land is not a result. Encoding failures are the
+      // same: the value cannot be recorded, so nothing may be concluded from it.
+      Effect.catchAll(
+        pass.store.settle({ kind: "promise.settle", head: head(), data: { id, state, value: encoded } }),
+        Edge.unavailable,
+      ),
+    ).pipe(Effect.catchAll(Edge.unavailable));
 
   // --- race: a local frame whose promise records the winner ----------------
   const race = (
@@ -482,6 +502,8 @@ export const make = (pass: Pass, frame: Frame): Context => {
   ): Effect.Effect<any, any> => {
     const o = options(opts);
     const breaks = o.id !== undefined;
+    const invalid = breaks ? Ids.validateRoot(o.id as string) : undefined;
+    if (invalid) return Effect.die(invalid);
     const id = breaks ? (o.id as string) : mint(frame);
     const slot = claim(frame);
 
@@ -517,17 +539,24 @@ export const make = (pass: Pass, frame: Frame): Context => {
         // Every branch runs to its own end — a value, a typed failure, or its
         // edge. Nothing is interrupted, so there are no torn creates to reason
         // about, and the branch ids come out in declaration order.
-        const exits = yield* Effect.ensuring(
-          Effect.all(
-            branches.map((branch) => withFlush(within(id, branch(inner)))),
-            { concurrency: "unbounded" },
-          ),
-          closeFrame(arena),
-        );
+        if (branches.length === 0) {
+          return yield* Effect.die(new Error(`ctx.race at '${id}' was given no branches; there is nothing to race`));
+        }
 
-        // Race exists to look at how its branches ended, edges included, so
-        // its own continuation is not on a caught path.
-        yield* FiberRef.set(caughtEdge, false);
+        // Race looks at how its branches ended, edges included, so its own
+        // continuation is not on a caught path — but only its own. Scoped, or
+        // it would disable the divergence check for the rest of the frame.
+        const exits = yield* Effect.locally(
+          Effect.ensuring(
+            Effect.all(
+              branches.map((branch) => withFlush(within(id, branch(inner)))),
+              { concurrency: "unbounded" },
+            ),
+            closeFrame(arena),
+          ),
+          caughtEdge,
+          false,
+        );
 
         const won = exits.findIndex(Exit.isSuccess);
         if (won >= 0) {
@@ -574,6 +603,8 @@ export const make = (pass: Pass, frame: Frame): Context => {
       const registered = fn !== undefined ? resolve(fn, o.version) : undefined;
       const name = registered ? registered.name : typeof fn === "string" ? fn : "";
       const breaks = o.id !== undefined;
+      const invalid = breaks ? Ids.validateRoot(o.id as string) : undefined;
+      if (invalid) return Effect.die(invalid);
       const seed = mint(frame);
       const id = breaks ? (o.id as string) : kind === "detached" ? Ids.detached(frame.originId, seed) : seed;
       const slot = claim(frame);
@@ -658,7 +689,7 @@ export const make = (pass: Pass, frame: Frame): Context => {
     );
 
   const promise = (opts: Options = {}) =>
-    Effect.map(remote("latent")(undefined, [{}, opts] as unknown[]), ({ id, record }) => ({
+    Effect.map(remote("latent")(undefined, [opts] as unknown[]), ({ id, record }) => ({
       id,
       await: Effect.uninterruptible(awaitRemote(id, record)),
     }));

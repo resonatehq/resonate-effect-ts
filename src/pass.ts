@@ -133,6 +133,16 @@ export const executeUntilBlocked = (
       });
     }
 
+    // A write that never landed says nothing about the computation. Give the
+    // lease back and let the next delivery try again — recording it as the
+    // workflow's result would make a rate limit permanent.
+    const unavailable = Edge.firstUnavailable(exit.cause);
+    if (unavailable) {
+      return yield* unavailable.cause instanceof Object && "_tag" in unavailable.cause
+        ? Effect.fail(unavailable.cause as PassError)
+        : new ExecutionError({ id: root.id, message: "a durable write did not land", cause: unavailable.cause });
+    }
+
     // Genuine interruption — the engine is giving up on this pass, not the
     // computation. Propagate; the task is released rather than settled.
     if (Cause.isInterruptedOnly(exit.cause)) return yield* Effect.failCause(exit.cause);

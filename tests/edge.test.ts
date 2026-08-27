@@ -460,3 +460,49 @@ describe("a frame does not settle over a promise it created", () => {
     expect(await Effect.runPromise(effect)).toMatchObject({ _tag: "Completed", state: "resolved" });
   });
 });
+
+describe("structured concurrency reaches the whole subtree", () => {
+  // Effect does not cascade: awaiting a fiber returns as soon as *it* is done
+  // and leaves its own unjoined children running. So a fork nested inside a
+  // fork is only reachable by walking down. Here every level abandons the next.
+  const work = Registry.register("work", (_c: Context, name: string, ms: number) =>
+    Effect.gen(function* () {
+      yield* Effect.promise(() => new Promise((r) => setTimeout(r, ms)));
+      return name;
+    }),
+  );
+
+  const chain = (c: Context, depth: number): Effect.Effect<unknown, unknown> =>
+    depth === 0
+      ? Effect.gen(function* () {
+          yield* Effect.fork(c.run(work, "bottom-work", 25));
+          yield* Effect.fork(c.rpc("bottom-call"));
+          return "bottom";
+        })
+      : Effect.gen(function* () {
+          yield* Effect.fork(c.run(work, `work-${depth}`, 20));
+          yield* Effect.fork(chain(c, depth - 1));
+          return `level ${depth}`;
+        });
+
+  it.each([1, 3, 6])("catches every child down a fork chain %i deep", async (depth) => {
+    const inner = Registry.register("inner", (c: Context) => chain(c, depth));
+    const wf = Registry.register("wf", (ctx: Context) => ctx.run(inner));
+    const { effect, server: s } = run([wf, inner, work], "wf", { latency: () => 20 });
+
+    const out = await Effect.runPromise(effect);
+    const awaited = out._tag === "Suspended" ? out.awaited : [];
+
+    // The one remote call at the bottom is the only thing left outstanding.
+    expect(awaited).toHaveLength(1);
+    const orphans = [...s.promises.values()].filter(
+      (p) => p.state === "pending" && p.tags["resonate:target"] && !awaited.includes(p.id),
+    );
+    expect(orphans).toEqual([]);
+
+    // Every abandoned local child still ran and was recorded: one per level,
+    // plus the one at the bottom.
+    const settled = [...s.promises.values()].filter((p) => p.state === "resolved");
+    expect(settled).toHaveLength(depth + 1);
+  }, 30_000);
+});

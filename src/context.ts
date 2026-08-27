@@ -699,8 +699,39 @@ const running = Effect.withFiberRuntime<ReadonlyArray<Fiber.RuntimeFiber<unknown
   ]),
 );
 
+const childrenOf = (
+  fiber: Fiber.RuntimeFiber<unknown, unknown>,
+): ReadonlyArray<Fiber.RuntimeFiber<unknown, unknown>> => [
+  ...((fiber as unknown as { getChildren?: () => Set<Fiber.RuntimeFiber<unknown, unknown>> }).getChildren?.() ??
+    new Set()),
+];
+
+/**
+ * Await every fiber below this one, not just the ones it forked directly.
+ *
+ * Effect does not cascade: awaiting a fiber returns as soon as *it* is done and
+ * leaves its own unjoined children running. So a fork nested inside a fork is
+ * reachable only by walking down, and by looping until nothing new appears —
+ * a child can spawn more while being awaited.
+ */
 const flush = (before: ReadonlyArray<Fiber.RuntimeFiber<unknown, unknown>>) =>
-  Effect.flatMap(running, (now) => Fiber.awaitAll(now.filter((fiber) => !before.includes(fiber))));
+  Effect.gen(function* () {
+    const seen = new Set(before);
+    for (;;) {
+      const frontier: Array<Fiber.RuntimeFiber<unknown, unknown>> = [];
+      const walk = (fibers: ReadonlyArray<Fiber.RuntimeFiber<unknown, unknown>>) => {
+        for (const fiber of fibers) {
+          if (seen.has(fiber)) continue;
+          seen.add(fiber);
+          frontier.push(fiber);
+          walk(childrenOf(fiber));
+        }
+      };
+      walk(yield* running);
+      if (frontier.length === 0) return;
+      yield* Fiber.awaitAll(frontier);
+    }
+  });
 
 /** Run `body`, then wait for anything it forked and left behind. */
 export const withFlush = <A, E, R>(body: Effect.Effect<A, E, R>): Effect.Effect<Exit.Exit<A, E>, never, R> =>

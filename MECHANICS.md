@@ -67,6 +67,10 @@ the list you check an implementation against.
   combinator — nothing else waits for it.
 - So each frame flushes: after the body, await the fibers *it* added. Not ones
   the caller already had running, or a frame could wait on a sibling waiting on it.
+- The flush walks the **whole subtree**, and loops until nothing new appears.
+  Effect does not cascade — awaiting a fiber returns as soon as that fiber is
+  done and leaves its own unjoined children running — so a fork nested inside a
+  fork is reachable only by walking down.
 - The flush runs inside the frame, before its edges merge upward — a fork that
   reaches its edge during the flush records it on that frame.
 - Without it a frame settles over a child still in flight, and a remote one is

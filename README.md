@@ -209,13 +209,22 @@ call appears in the source. So `Effect.all([ctx.rpc(a), ctx.rpc(b)])` orders `a`
 before `b` by construction, not by whichever fiber the scheduler happens to
 start.
 
-**Durable frames run uninterruptible.** When one branch of a fan-out reaches its
-edge and Effect interrupts its siblings, a sibling defers that interruption,
-runs on to *its* edge, records it, and stops there — so one pass discovers every
-frontier instead of one per pass. The cost is that genuine interruption
-(shutdown, a lost lease) waits for the body to reach its next edge or finish,
-and that latency scales with the depth of the call tree. A sibling whose fiber
-has not started yet is not protected by this and is simply found next pass.
+**Durable frames run uninterruptible.** This is what stops a pass from
+abandoning work in flight. When one branch of a fan-out reaches its edge and
+Effect interrupts its siblings, a sibling defers that interruption and runs on:
+if it is going to block, it reaches *its* edge and records it, so one pass
+discovers every frontier instead of one per pass; and if it is not blocked —
+it is halfway through a database query, an HTTP call, any ordinary Effect — it
+finishes, settles its promise, and only then goes down. A `ctx.run` is never cut
+short in the middle. Anything below it that is not transitively blocked on an
+`rpc` runs to completion and is recorded, so the next pass replays it instead of
+redoing it.
+
+The cost is that genuine interruption (shutdown, a lost lease) waits for the
+body to reach its next edge or finish, and that latency scales with the depth of
+the call tree. And a sibling whose fiber has *not started at all* is not
+protected by this — nothing was created, so nothing is lost, and it simply runs
+next pass.
 
 ## Not yet here
 

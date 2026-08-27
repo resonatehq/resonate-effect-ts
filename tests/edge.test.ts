@@ -228,3 +228,116 @@ describe("sleep and detached", () => {
     expect(spawned?.tags["resonate:branch"]).toBe(spawned?.id);
   });
 });
+
+describe("local work is never abandoned", () => {
+  // A leaf that does real non-durable work — a database query, an HTTP call —
+  // inside its durable frame. If a pass could be torn down in the middle of
+  // one of these, a workflow whose siblings block would never make progress.
+  const query = (ms: number, result: string) =>
+    Registry.register("query", (_ctx: Context) =>
+      Effect.map(
+        Effect.promise(() => new Promise((r) => setTimeout(r, ms))),
+        () => result,
+      ),
+    );
+
+  it("finishes a local run that is mid-query when a sibling reaches its edge", async () => {
+    const q = query(60, "rows");
+    const wf = Registry.register("wf", (ctx: Context) =>
+      Effect.all([ctx.run(q), ctx.rpc("remote")], { concurrency: "unbounded" }),
+    );
+    // The rpc's create comes back at once, so it blocks long before the query
+    // is anywhere near done.
+    const { effect, server: s } = run([wf, q], "wf", { latency: () => 0 });
+
+    const out = await Effect.runPromise(effect);
+
+    expect(out).toEqual({ _tag: "Suspended", awaited: ["foo:2"] });
+    // The query ran to completion and its result is durable — the next pass
+    // replays it instead of re-querying.
+    expect(s.journal).toContain("settle foo:1 resolved");
+    expect(s.promises.get("foo:1")?.state).toBe("resolved");
+  });
+
+  it("finishes it even when the blocking sibling is declared first", async () => {
+    const q = query(60, "rows");
+    const wf = Registry.register("wf", (ctx: Context) =>
+      Effect.all([ctx.rpc("remote"), ctx.run(q)], { concurrency: "unbounded" }),
+    );
+    const { effect, server: s } = run([wf, q], "wf", { latency: () => 0 });
+
+    const out = await Effect.runPromise(effect);
+
+    expect(out).toEqual({ _tag: "Suspended", awaited: ["foo:1"] });
+    expect(s.promises.get("foo:2")?.state).toBe("resolved");
+  });
+
+  it("finishes local work nested below a blocking sibling's peer", async () => {
+    const q = query(50, "deep rows");
+    const middle = Registry.register("middle", (ctx: Context) => ctx.run(q));
+    const wf = Registry.register("wf", (ctx: Context) =>
+      Effect.all([ctx.run(middle), ctx.rpc("remote")], { concurrency: "unbounded" }),
+    );
+    const { effect, server: s } = run([wf, middle, q], "wf", { latency: () => 0 });
+
+    const out = await Effect.runPromise(effect);
+
+    expect(out).toEqual({ _tag: "Suspended", awaited: ["foo:2"] });
+    // Both levels settled: the whole unblocked subtree ran.
+    expect(s.promises.get("foo:1.1")?.state).toBe("resolved");
+    expect(s.promises.get("foo:1")?.state).toBe("resolved");
+  });
+
+  it("makes the next pass cheap: the finished work replays, only the edge is new", async () => {
+    const q = query(40, "rows");
+    const wf = Registry.register("wf", (ctx: Context) =>
+      Effect.all([ctx.run(q), ctx.rpc("remote")], { concurrency: "unbounded" }),
+    );
+    const { effect, server: s } = run([wf, q], "wf", { latency: () => 0 });
+    await Effect.runPromise(effect);
+
+    // Second pass, with the local child handed back in the preload.
+    const preload = [...s.promises.values()].filter((p) => p.tags["resonate:branch"] === "foo");
+    const s2 = server();
+    for (const p of s.promises.values()) s2.seed(p);
+    const second = await Effect.runPromise(
+      Pass.executeUntilBlocked({ task: task(), promise: root("wf"), preload }, { target: "poll://worker" }).pipe(
+        Effect.provide(Layer.mergeAll(s2.layer, Codec.layerJson, Registry.layer([wf, q]))),
+      ),
+    );
+
+    // Still blocked on the remote, but the query did not run a second time.
+    expect(second).toEqual({ _tag: "Suspended", awaited: ["foo:2"] });
+    expect(s2.journal).not.toContain("settle foo:1 resolved");
+  });
+  it.each([
+    ["run then rpc", (c: Context, q: Registry.Registration) => [c.run(q), c.rpc("r")]],
+    ["rpc then run", (c: Context, q: Registry.Registration) => [c.rpc("r"), c.run(q)]],
+    [
+      "alternating x8",
+      (c: Context, q: Registry.Registration) =>
+        Array.from({ length: 8 }, (_, i) => (i % 2 === 0 ? c.rpc("r") : c.run(q))),
+    ],
+  ])("leaves no local promise pending unless its subtree is blocked (%s)", async (_label, shape) => {
+    const q = Registry.register("q", (_c: Context) =>
+      Effect.map(
+        Effect.promise(() => new Promise((r) => setTimeout(r, 25))),
+        () => "rows",
+      ),
+    );
+    const wf = Registry.register("wf", (ctx: Context) => Effect.all(shape(ctx, q), { concurrency: "unbounded" }));
+    // An instant server is the adversarial case: a branch can finish before its
+    // siblings are scheduled at all.
+    const { effect, server: s } = run([wf, q], "wf", { latency: () => 0 });
+
+    const out = await Effect.runPromise(effect);
+    const awaited = out._tag === "Suspended" ? out.awaited : [];
+
+    // A local promise left pending, with nothing below it blocked, would mean
+    // work was created and then thrown away.
+    const orphaned = [...s.promises.values()].filter(
+      (p) => p.tags["resonate:scope"] === "local" && p.state === "pending" && !awaited.some((a) => a.startsWith(p.id)),
+    );
+    expect(orphaned.map((p) => p.id)).toEqual([]);
+  });
+});

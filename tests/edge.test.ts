@@ -341,3 +341,65 @@ describe("local work is never abandoned", () => {
     expect(orphaned.map((p) => p.id)).toEqual([]);
   });
 });
+
+describe("a frame waits for what it spawned", () => {
+  // An Effect.fork the body never joins is attached to the fiber, not to any
+  // combinator, so nothing else waits for it. Without the flush the frame
+  // settles while that child is still in flight — and a remote one is then live
+  // with nobody awaiting it: a workflow that completed over an outstanding call.
+  const forkRpc = Registry.register("forkRpc", (c: Context) =>
+    Effect.gen(function* () {
+      yield* Effect.fork(c.rpc("remote"));
+      return "parent returned";
+    }),
+  );
+  const slow = Registry.register("slow", (_c: Context) =>
+    Effect.map(
+      Effect.promise(() => new Promise((r) => setTimeout(r, 40))),
+      () => "done",
+    ),
+  );
+  const forkBoth = Registry.register("forkBoth", (c: Context) =>
+    Effect.gen(function* () {
+      yield* Effect.fork(c.rpc("remote"));
+      yield* Effect.fork(c.run(slow));
+      return "parent returned";
+    }),
+  );
+
+  it("does not settle over a forked rpc the body never joined", async () => {
+    const wf = Registry.register("wf", (ctx: Context) => ctx.run(forkRpc));
+    const { effect, server: s } = run([wf, forkRpc], "wf");
+
+    const out = await Effect.runPromise(effect);
+
+    expect(out).toEqual({ _tag: "Suspended", awaited: ["foo:1.1"] });
+    expect(s.promises.get("foo:1")?.state).toBe("pending");
+    // Nothing remote is left pending that the pass is not waiting on.
+    const orphans = [...s.promises.values()].filter(
+      (p) =>
+        p.state === "pending" &&
+        p.tags["resonate:target"] &&
+        !(out as { awaited: ReadonlyArray<string> }).awaited.includes(p.id),
+    );
+    expect(orphans).toEqual([]);
+  });
+
+  it("still finishes the forked local work while doing it", async () => {
+    const wf = Registry.register("wf", (ctx: Context) => ctx.run(forkBoth));
+    const { effect, server: s } = run([wf, forkBoth, slow], "wf");
+
+    const out = await Effect.runPromise(effect);
+
+    expect(out).toEqual({ _tag: "Suspended", awaited: ["foo:1.1"] });
+    expect(s.promises.get("foo:1.2")?.state).toBe("resolved");
+  });
+
+  it("carries the edge up through nested frames", async () => {
+    const middle = Registry.register("middle", (c: Context) => c.run(forkRpc));
+    const wf = Registry.register("wf", (ctx: Context) => ctx.run(middle));
+    const { effect } = run([wf, middle, forkRpc], "wf");
+
+    expect(await Effect.runPromise(effect)).toEqual({ _tag: "Suspended", awaited: ["foo:1.1.1"] });
+  });
+});

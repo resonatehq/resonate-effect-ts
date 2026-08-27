@@ -54,6 +54,19 @@ the list you check an implementation against.
 - The root frame's set is the pass's answer. Sorted, so a run reports the same
   thing twice.
 
+## Structured concurrency
+
+- A frame does not finish while work it spawned is still running.
+- `ctx.run` awaits the body; the body's combinators join what they fork. An
+  `Effect.fork` the body never joins is attached to the fiber, not to any
+  combinator — nothing else waits for it.
+- So each frame flushes: after the body, await the fibers *it* added. Not ones
+  the caller already had running, or a frame could wait on a sibling waiting on it.
+- The flush runs inside the frame, before its edges merge upward — a fork that
+  reaches its edge during the flush records it on that frame.
+- Without it a frame settles over a child still in flight, and a remote one is
+  then live with nobody awaiting it. This is `flushLocalWork`.
+
 ## Three guards
 
 1. **Atomic claim and create.** Minting an id and creating its promise are one

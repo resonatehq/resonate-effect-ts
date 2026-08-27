@@ -1,4 +1,4 @@
-import { Cause, Clock, Effect, Exit, Fiber, Layer } from "effect";
+import { Cause, Clock, Effect, Exit, Fiber, identity, Layer } from "effect";
 import { Codec, type CodecService } from "./codec.js";
 import type { Connection } from "./connection.js";
 import * as Ctx from "./context.js";
@@ -89,7 +89,9 @@ export const executeUntilBlocked = (
     let frame!: Ctx.Frame;
     const body = Effect.suspend(() => {
       frame = Ctx.rootFrame(root, registered.name, registered.version, ++attempt);
-      return registered.workflow(Ctx.make(pass, frame), ...param.args);
+      // Same as every frame below it: the root does not finish while work it
+      // spawned is still running.
+      return Effect.flatMap(Ctx.withFlush(registered.workflow(Ctx.make(pass, frame), ...param.args)), identity);
     });
 
     // The body gets its own fiber. It has to: the sentinel tears down every

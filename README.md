@@ -161,7 +161,9 @@ still outstanding suspends anyway, exactly as in the generator engine.
 `Fiber.join`. There is no `begin` variant, because forking a `ctx.rpc` and
 joining it later already is one. Fire-and-forget `fork` with no join is the one
 shape durable execution cannot express — the parent would settle over an
-outstanding promise — so join your children.
+outstanding promise — so every frame flushes: after its body returns it awaits
+the fibers it added, which is how an unjoined fork's edge still reaches the
+settle guard.
 
 `Effect.race` is the same shape, so racing gets its own operation:
 

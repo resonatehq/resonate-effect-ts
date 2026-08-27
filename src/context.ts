@@ -1,4 +1,4 @@
-import { Cause, Clock, Deferred, Effect, Exit, FiberId, FiberRef } from "effect";
+import { Cause, Clock, Deferred, Effect, Exit, Fiber, FiberId, FiberRef, identity } from "effect";
 import type { CodecService } from "./codec.js";
 import * as Edge from "./edge.js";
 import * as Ids from "./ids.js";
@@ -421,7 +421,13 @@ export const make = (pass: Pass, frame: Frame): Context => {
         let attempt = 0;
         const body = Effect.suspend(() => {
           child = childFrame(frame, id, record, registered.name, registered.version, ++attempt);
-          return Effect.ensuring(registered.workflow(make(pass, child), ...args), closeFrame(child, frame));
+          // Flush inside the frame, not around it: a fork that reaches its edge
+          // during the flush records it on *this* frame, and the merge into the
+          // parent has to happen after that, not before.
+          return Effect.ensuring(
+            Effect.flatMap(withFlush(registered.workflow(make(pass, child), ...args)), identity),
+            closeFrame(child, frame),
+          );
         });
 
         const exit = yield* Effect.exit(Retries.apply(body, o.retry, record.timeoutAt, now));
@@ -500,7 +506,7 @@ export const make = (pass: Pass, frame: Frame): Context => {
         // about, and the branch ids come out in declaration order.
         const exits = yield* Effect.ensuring(
           Effect.all(
-            branches.map((branch) => Effect.exit(branch(inner))),
+            branches.map((branch) => withFlush(branch(inner))),
             { concurrency: "unbounded" },
           ),
           closeFrame(arena),
@@ -660,6 +666,39 @@ export const make = (pass: Pass, frame: Frame): Context => {
 
 // The Dewey segment for the next child, consumed in source order.
 const mint = (frame: Frame): string => Ids.join(frame.id, frame.seq++);
+
+/**
+ * A frame does not finish while work it spawned is still running.
+ *
+ * `ctx.run` awaits the body, and the body's own combinators join whatever they
+ * fork — but an `Effect.fork` the body never joins is attached to the fiber, not
+ * to any combinator, and nothing else waits for it. Without this the frame
+ * settles its promise while a child it started is still in flight, and a remote
+ * one is then live with nobody awaiting it: a workflow that completed over an
+ * outstanding call.
+ *
+ * Only fibers this frame added are awaited, not ones the caller already had
+ * running, so a frame never waits on a sibling that might be waiting on it.
+ * This is the generator engine's `flushLocalWork`, and it is what lets the
+ * settle guard see a forked child's edge.
+ */
+const running = Effect.withFiberRuntime<ReadonlyArray<Fiber.RuntimeFiber<unknown, unknown>>, never, never>((self) =>
+  Effect.succeed([
+    ...((self as unknown as { getChildren(): Set<Fiber.RuntimeFiber<unknown, unknown>> }).getChildren() ?? new Set()),
+  ]),
+);
+
+const flush = (before: ReadonlyArray<Fiber.RuntimeFiber<unknown, unknown>>) =>
+  Effect.flatMap(running, (now) => Fiber.awaitAll(now.filter((fiber) => !before.includes(fiber))));
+
+/** Run `body`, then wait for anything it forked and left behind. */
+export const withFlush = <A, E, R>(body: Effect.Effect<A, E, R>): Effect.Effect<Exit.Exit<A, E>, never, R> =>
+  Effect.gen(function* () {
+    const before = yield* running;
+    const exit = yield* Effect.exit(body);
+    yield* flush(before);
+    return exit;
+  });
 
 /** What a race promise records as its function. It has no code behind it. */
 const RACE = "resonate:race";

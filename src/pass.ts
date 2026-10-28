@@ -104,7 +104,7 @@ export const executeUntilBlocked = (
     // And the body runs uninterruptible as a whole, not merely one durable
     // frame at a time. When a branch reaches its edge, Effect interrupts its
     // siblings; a sibling inside a durable frame defers that and finishes, but
-    // one *between* frames — in a `catchAll` handler about to start the
+    // one *between* frames — in a `catch` handler about to start the
     // recovery, in the code after a child returned — has no such cover, and
     // would be cut off there. That loses work the pass could have done, and
     // worse, it silently shifts every id minted after it: the next pass runs
@@ -112,7 +112,7 @@ export const executeUntilBlocked = (
     // sequence gets a different id and a second promise. A pass ends when its
     // work is done or blocked, never in the middle of a step.
     const exit = yield* Fiber.await(
-      yield* Effect.fork(Effect.uninterruptible(Retries.apply(body, param.retry, root.timeoutAt, now))),
+      yield* Effect.forkChild(Effect.uninterruptible(Retries.apply(body, param.retry, root.timeoutAt, now))),
     );
 
     // The root frame's edges decide — before the exit is even looked at.
@@ -145,12 +145,12 @@ export const executeUntilBlocked = (
 
     // Genuine interruption — the engine is giving up on this pass, not the
     // computation. Propagate; the task is released rather than settled.
-    if (Cause.isInterruptedOnly(exit.cause)) return yield* Effect.failCause(exit.cause);
+    if (Cause.hasInterruptsOnly(exit.cause)) return yield* Effect.failCause(exit.cause);
 
     // A typed failure is a value the promise can hold, so the computation is
     // finished: reject it. A defect is a bug, and rejecting is still better
     // than a task that is redelivered forever.
-    const failure = Cause.failureOption(exit.cause);
+    const failure = Cause.findErrorOption(exit.cause);
     const error = failure._tag === "Some" ? failure.value : squash(exit.cause);
     return completed(root.id, "rejected", yield* codec.encode(error));
   });
@@ -181,7 +181,7 @@ const decodeParam = (root: PromiseRecord, codec: CodecService): Effect.Effect<Pa
     }),
   );
 
-const squash = (cause: Cause.Cause<unknown>): unknown => [...Cause.defects(cause)][0] ?? new Error(Cause.pretty(cause));
+const squash = (cause: Cause.Cause<unknown>): unknown => Edge.defects(cause)[0] ?? new Error(Cause.pretty(cause));
 
 /**
  * The executor the engine drives: one pass per call, everything it needs bound

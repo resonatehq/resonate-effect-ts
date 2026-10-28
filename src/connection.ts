@@ -21,7 +21,7 @@ export interface ConnectionService {
   readonly send: <K extends Kind>(request: RequestOf<K>) => Effect.Effect<ResponseOf<K>, TransportError>;
 }
 
-export class Connection extends Context.Tag("@resonatehq/effect/Connection")<Connection, ConnectionService>() {}
+export class Connection extends Context.Service<Connection, ConnectionService>()("@resonatehq/effect/Connection") {}
 
 /** Send a request over the ambient connection. */
 export const send = <K extends Kind>(request: RequestOf<K>): Effect.Effect<ResponseOf<K>, TransportError, Connection> =>
@@ -42,7 +42,7 @@ export interface HttpOptions {
   /** Server url. Defaults to `RESONATE_URL`, then `http://localhost:8001`. */
   readonly url?: string;
   /** Per-request timeout. Defaults to 10 seconds. */
-  readonly timeout?: Duration.DurationInput;
+  readonly timeout?: Duration.Input;
   /** Bearer token, sent both as an `Authorization` header and as `head.auth`. */
   readonly token?: string;
   /** Extra headers, merged over the defaults. */
@@ -59,7 +59,7 @@ export interface HttpOptions {
  */
 export const http = (options: HttpOptions = {}): ConnectionService => {
   const url = options.url ?? globalThis.process?.env?.RESONATE_URL ?? "http://localhost:8001";
-  const timeout = Duration.decode(options.timeout ?? Duration.seconds(10));
+  const timeout = Duration.fromInputUnsafe(options.timeout ?? Duration.seconds(10));
   const token = options.token ?? globalThis.process?.env?.RESONATE_TOKEN;
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -93,9 +93,9 @@ export const http = (options: HttpOptions = {}): ConnectionService => {
           isResponse(res) && res.kind === request.kind && res.head.corrId === request.head.corrId,
         () => fail("malformed", "response did not match request"),
       ),
-      Effect.timeoutFail({
+      Effect.timeoutOrElse({
         duration: timeout,
-        onTimeout: () => fail("timeout", `no response within ${Duration.format(timeout)}`),
+        orElse: () => Effect.fail(fail("timeout", `no response within ${Duration.format(timeout)}`)),
       }),
     );
   });

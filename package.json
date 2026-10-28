@@ -23,17 +23,21 @@
     "test": "vitest run",
     "check": "biome check",
     "check:fix": "biome check --write",
-    "fmt": "biome format --write"
+    "fmt": "biome format --write",
+    "example:fibonacci": "tsx examples/fibonacci.ts",
+    "example:research": "tsx examples/research.ts",
+    "validate": "npm run type-check && npm run check && npm test && npm run build"
   },
   "peerDependencies": {
-    "effect": "^3.22.0"
+    "effect": "4.0.5"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.4.2",
+    "@biomejs/biome": "2.6.2",
     "@types/node": "^22.20.1",
-    "effect": "^3.22.1",
-    "typescript": "^5.9.3",
-    "vitest": "^4.1.11"
+    "effect": "4.0.5",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2",
+    "vitest": "5.0.5"
   },
   "license": "Apache-2.0"
 }

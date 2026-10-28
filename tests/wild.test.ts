@@ -63,14 +63,14 @@ const wild = Registry.register("wild", (ctx: Context) =>
       ctx.run(level1),
       // forked, non-durable work in between, joined after
       Effect.gen(function* () {
-        const f = yield* Effect.fork(ctx.run(query, "forked", 800));
+        const f = yield* Effect.forkChild(ctx.run(query, "forked", 800));
         yield* wait(200);
         return yield* Fiber.join(f);
       }),
       // a child that fails, recovered by another child started from the handler
       // Built inside a catch handler, so *when* it is constructed depends on
       // timing. Pinned, or it would take whatever number the counter is at.
-      ctx.run(failing).pipe(Effect.catchAll(() => ctx.run(query, ["recovered", 400], { id: "wild-recovered" }))),
+      ctx.run(failing).pipe(Effect.catch(() => ctx.run(query, ["recovered", 400], { id: "wild-recovered" }))),
       // a batch, each element its own durable child
       // Same: built inside a forEach body, so pinned too.
       Effect.forEach([300, 500, 700], (ms) => ctx.run(query, [`each${ms}`, ms], { id: `wild-each${ms}` }), {
@@ -201,7 +201,7 @@ describe("an id taken twice is caught, not silently obeyed", () => {
   const drifting = Registry.register("drifting", (ctx: Context) =>
     Effect.all(
       [
-        ctx.run(failing).pipe(Effect.catchAll(() => ctx.run(query, "recovered", 10))),
+        ctx.run(failing).pipe(Effect.catch(() => ctx.run(query, "recovered", 10))),
         Effect.forEach([20, 30], (ms) => ctx.run(query, `each${ms}`, ms), { concurrency: "unbounded" }),
       ],
       { concurrency: "unbounded" },
@@ -238,4 +238,46 @@ describe("an id taken twice is caught, not silently obeyed", () => {
     expect(message).toContain("already exists and holds a different call");
     expect(message).toContain("options({ id })");
   }, 30_000);
+});
+
+describe("an id taken twice is caught while still pending", () => {
+  // The same swap, with nothing settled yet. Both calls are remote and still
+  // outstanding when the second pass reaches them in the other order, so each
+  // create dedups against a pending promise that holds the other call. Checking
+  // only settled records would let the pass suspend on two promises that belong
+  // to the wrong branches, and their results would later land crosswise.
+  const shape = (order: ReadonlyArray<string>) =>
+    Registry.register("swap", (ctx: Context) =>
+      Effect.all(
+        order.map((side) => ctx.rpc("remote", side)),
+        { concurrency: "unbounded" },
+      ),
+    );
+
+  const pass = (s: ReturnType<typeof server>, workflow: Registry.Registration) =>
+    Pass.executeUntilBlocked({ task: task(), promise: root("swap"), preload: [] }, { target: "poll://worker" }).pipe(
+      Effect.provide(Layer.mergeAll(s.layer, Codec.layerJson, Registry.layer([workflow]))),
+    );
+
+  it("rejects with a diagnostic instead of suspending on the wrong promises", async () => {
+    const s = server();
+    const first = await Effect.runPromise(pass(s, shape(["left", "right"])));
+    expect(first).toEqual({ _tag: "Suspended", awaited: ["foo:1", "foo:2"] });
+    expect(s.promises.get("foo:1")?.state).toBe("pending");
+
+    const out = await Effect.runPromise(pass(s, shape(["right", "left"])));
+
+    expect(out).toMatchObject({ _tag: "Completed", state: "rejected" });
+    const message = String((decode((out as { value: { data?: string } }).value) as Error).message);
+    expect(message).toContain("promise 'foo:1' already exists and holds a different call");
+  });
+
+  it("lets a replay through that makes the same pending call again", async () => {
+    const s = server();
+    await Effect.runPromise(pass(s, shape(["left", "right"])));
+
+    const out = await Effect.runPromise(pass(s, shape(["left", "right"])));
+
+    expect(out).toEqual({ _tag: "Suspended", awaited: ["foo:1", "foo:2"] });
+  });
 });

@@ -35,23 +35,27 @@ export const isPolicy = (u: unknown): u is Policy =>
 export const toSchedule = (policy: Policy, deadline: number, now: number): Schedule.Schedule<unknown> | undefined => {
   const remaining = Math.max(0, deadline - now);
   const bound = <O>(s: Schedule.Schedule<O>): Schedule.Schedule<unknown> =>
-    Schedule.intersect(s, Schedule.recurUpTo(Duration.millis(remaining))) as Schedule.Schedule<unknown>;
+    Schedule.max([s, Schedule.during(Duration.millis(remaining))]) as Schedule.Schedule<unknown>;
 
   switch (policy.type) {
     case "never":
       return undefined;
     case "constant": {
       const { delay = 1_000, maxAttempts = 3 } = policy.data ?? {};
-      return bound(Schedule.intersect(Schedule.spaced(Duration.millis(delay)), Schedule.recurs(maxAttempts - 1)));
+      return bound(Schedule.max([Schedule.spaced(Duration.millis(delay)), Schedule.recurs(maxAttempts - 1)]));
     }
     case "linear": {
       const { delay = 1_000, maxAttempts = 3 } = policy.data ?? {};
-      return bound(Schedule.intersect(Schedule.linear(Duration.millis(delay)), Schedule.recurs(maxAttempts - 1)));
+      // Effect 4 has no linear schedule: the nth retry waits n times the delay.
+      const linear = Schedule.modifyDelay(Schedule.forever, ({ attempt }) =>
+        Effect.succeed(Duration.millis(delay * attempt)),
+      );
+      return bound(Schedule.max([linear, Schedule.recurs(maxAttempts - 1)]));
     }
     case "exponential": {
       const { delay = 1_000, factor = 2, maxAttempts = 5 } = policy.data ?? {};
       return bound(
-        Schedule.intersect(Schedule.exponential(Duration.millis(delay), factor), Schedule.recurs(maxAttempts - 1)),
+        Schedule.max([Schedule.exponential(Duration.millis(delay), factor), Schedule.recurs(maxAttempts - 1)]),
       );
     }
   }

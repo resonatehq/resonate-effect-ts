@@ -3,6 +3,7 @@ import * as Connection from "./connection.js";
 import type * as Correlation from "./correlation.js";
 import { ProtocolError, type ServerError, serverError, type TransportError } from "./errors.js";
 import * as Executor from "./executor.js";
+import * as Heartbeat from "./heartbeat.js";
 import { type ExecuteMsg, isRedirect, isSuccess, type PromiseRecord, type TaskRecord, type Value } from "./protocol.js";
 import * as Requests from "./requests.js";
 
@@ -111,7 +112,7 @@ export interface EngineService {
   readonly process: (task: Task) => Effect.Effect<Outcome, EngineError>;
 }
 
-export class Engine extends Context.Tag("@resonatehq/effect/Engine")<Engine, EngineService>() {}
+export class Engine extends Context.Service<Engine, EngineService>()("@resonatehq/effect/Engine") {}
 
 type Requirements = Connection.Connection | Correlation.Correlation | Executor.Executor;
 
@@ -181,7 +182,15 @@ const run = (claim: Claimed): Effect.Effect<Outcome, EngineError, Requirements> 
   // Whatever goes wrong, hand the lease back rather than making the next worker
   // wait out the ttl. Best effort: if the release itself fails the original
   // failure is the one worth reporting.
-  return Effect.onError(pass(claim.preload), () => Effect.ignore(release(task)));
+  //
+  // The lease is kept alive for exactly as long as this runs — through every
+  // continue, until the task is fulfilled, suspended, dropped, or released.
+  return Effect.scoped(
+    Effect.andThen(
+      Heartbeat.hold(task),
+      Effect.onError(pass(claim.preload), () => Effect.ignore(release(task))),
+    ),
+  );
 };
 
 const fulfill = (task: TaskRecord, execution: Executor.Completed): Effect.Effect<Outcome, EngineError, Requirements> =>

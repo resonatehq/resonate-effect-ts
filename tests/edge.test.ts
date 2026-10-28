@@ -43,8 +43,8 @@ describe("creation is ordered, even under concurrency", () => {
   it("orders ids by construction, not by which fiber the scheduler starts", async () => {
     const forks = Registry.register("forks", (ctx: Context) =>
       Effect.gen(function* () {
-        const a = yield* Effect.fork(ctx.rpc("a"));
-        const b = yield* Effect.fork(ctx.rpc("b"));
+        const a = yield* Effect.forkChild(ctx.rpc("a"));
+        const b = yield* Effect.forkChild(ctx.rpc("b"));
         yield* Effect.sleep("40 millis");
         return yield* Fiber.joinAll([a, b]);
       }),
@@ -132,7 +132,7 @@ describe("the guards", () => {
 
   it("does not settle a child whose subtree reached an edge, even if the block was caught", async () => {
     const swallow = Registry.register("swallow", (ctx: Context) =>
-      ctx.run(blocked).pipe(Effect.catchAllCause(() => Effect.succeed("substituted"))),
+      ctx.run(blocked).pipe(Effect.catchCause(() => Effect.succeed("substituted"))),
     );
     const { effect, server: s } = run([swallow, blocked], "swallow");
 
@@ -144,20 +144,14 @@ describe("the guards", () => {
 
   it.each([
     ["Effect.exit", (e: Effect.Effect<any, any>) => e.pipe(Effect.exit, Effect.as("substituted"))],
-    [
-      "catchAllCause",
-      (e: Effect.Effect<any, any>) => e.pipe(Effect.catchAllCause(() => Effect.succeed("substituted"))),
-    ],
-    [
-      "catchAllDefect",
-      (e: Effect.Effect<any, any>) => e.pipe(Effect.catchAllDefect(() => Effect.succeed("substituted"))),
-    ],
+    ["catchCause", (e: Effect.Effect<any, any>) => e.pipe(Effect.catchCause(() => Effect.succeed("substituted")))],
+    ["catchDefect", (e: Effect.Effect<any, any>) => e.pipe(Effect.catchDefect(() => Effect.succeed("substituted")))],
     [
       "sandbox",
       (e: Effect.Effect<any, any>) =>
         e.pipe(
           Effect.sandbox,
-          Effect.catchAll(() => Effect.succeed("substituted")),
+          Effect.catch(() => Effect.succeed("substituted")),
         ),
     ],
   ])("survives a caught block via %s", async (_label, wrap) => {
@@ -171,7 +165,7 @@ describe("the guards", () => {
   it("refuses a durable operation on a path that already reached an edge", async () => {
     const diverge = Registry.register("diverge", (ctx: Context) =>
       Effect.gen(function* () {
-        yield* ctx.rpc("a").pipe(Effect.catchAllCause(() => Effect.succeed("substituted")));
+        yield* ctx.rpc("a").pipe(Effect.catchCause(() => Effect.succeed("substituted")));
         return yield* ctx.rpc("b"); // would mint an id the next pass will not
       }),
     );
@@ -184,11 +178,37 @@ describe("the guards", () => {
     expect([...s.promises.keys()]).toEqual(["foo:1"]);
   });
 
+  // Pinned, not endorsed. Here the block happens on a concurrent child fiber
+  // and the parent swallows it. Effect 3's FiberRef spread the mark to the
+  // parent on join; Effect 4 has no join hook, so the parent is not refused and
+  // mints on the diverged path. What still holds: the frame does not settle,
+  // and the next pass, taking the real path, finds the stale record under the
+  // same id and stops with a diagnostic instead of reading it.
+  it("catches a block swallowed across fibers on the next pass", async () => {
+    const diverge = Registry.register("diverge", (ctx: Context) =>
+      Effect.gen(function* () {
+        const exit = yield* Effect.all([ctx.rpc("a")], { concurrency: "unbounded" }).pipe(Effect.exit);
+        return yield* exit._tag === "Failure" ? ctx.rpc("fallback") : ctx.rpc("b");
+      }),
+    );
+    const { effect, server: s } = run([diverge], "diverge");
+
+    expect(await Effect.runPromise(effect)).toEqual({ _tag: "Suspended", awaited: ["foo:1", "foo:2"] });
+    s.settleExternally("foo:1", "a's answer");
+
+    const out = await Effect.runPromise(effect);
+
+    expect(out).toMatchObject({ _tag: "Completed", state: "rejected" });
+    expect(String((decodeValue(out) as Error).message)).toContain(
+      "promise 'foo:2' already exists and holds a different call",
+    );
+  });
+
   it("lets the error channel through untouched", async () => {
     const handled = Registry.register("handled", (ctx: Context) =>
       Effect.gen(function* () {
         const failing = Registry.register("failing", (_c: Context) => Effect.fail("expected"));
-        return yield* ctx.run(failing).pipe(Effect.catchAll((e) => Effect.succeed(`caught ${e}`)));
+        return yield* ctx.run(failing).pipe(Effect.catch((e) => Effect.succeed(`caught ${e}`)));
       }),
     );
     const failing = Registry.register("failing", (_c: Context) => Effect.fail("expected"));
@@ -349,7 +369,7 @@ describe("a frame waits for what it spawned", () => {
   // with nobody awaiting it: a workflow that completed over an outstanding call.
   const forkRpc = Registry.register("forkRpc", (c: Context) =>
     Effect.gen(function* () {
-      yield* Effect.fork(c.rpc("remote"));
+      yield* Effect.forkChild(c.rpc("remote"));
       return "parent returned";
     }),
   );
@@ -361,8 +381,8 @@ describe("a frame waits for what it spawned", () => {
   );
   const forkBoth = Registry.register("forkBoth", (c: Context) =>
     Effect.gen(function* () {
-      yield* Effect.fork(c.rpc("remote"));
-      yield* Effect.fork(c.run(slow));
+      yield* Effect.forkChild(c.rpc("remote"));
+      yield* Effect.forkChild(c.run(slow));
       return "parent returned";
     }),
   );
@@ -462,9 +482,6 @@ describe("a frame does not settle over a promise it created", () => {
 });
 
 describe("structured concurrency reaches the whole subtree", () => {
-  // Effect does not cascade: awaiting a fiber returns as soon as *it* is done
-  // and leaves its own unjoined children running. So a fork nested inside a
-  // fork is only reachable by walking down. Here every level abandons the next.
   const work = Registry.register("work", (_c: Context, name: string, ms: number) =>
     Effect.gen(function* () {
       yield* Effect.promise(() => new Promise((r) => setTimeout(r, ms)));
@@ -472,39 +489,75 @@ describe("structured concurrency reaches the whole subtree", () => {
     }),
   );
 
+  // Fan-out the way it is meant to be written: every level runs its work and
+  // the level below it side by side, and `Effect.all` joins both.
+  const tree = (c: Context, depth: number): Effect.Effect<unknown, unknown> =>
+    depth === 0
+      ? Effect.all([c.run(work, "bottom-work", 25), c.rpc("bottom-call")], { concurrency: "unbounded" })
+      : Effect.all([c.run(work, `work-${depth}`, 20), tree(c, depth - 1)], { concurrency: "unbounded" });
+
+  // The same tree with every level forking the next and never joining it.
   const chain = (c: Context, depth: number): Effect.Effect<unknown, unknown> =>
     depth === 0
       ? Effect.gen(function* () {
-          yield* Effect.fork(c.run(work, "bottom-work", 25));
-          yield* Effect.fork(c.rpc("bottom-call"));
+          yield* Effect.forkChild(c.run(work, "bottom-work", 25));
+          yield* Effect.forkChild(c.rpc("bottom-call"));
           return "bottom";
         })
       : Effect.gen(function* () {
-          yield* Effect.fork(c.run(work, `work-${depth}`, 20));
-          yield* Effect.fork(chain(c, depth - 1));
+          yield* Effect.forkChild(c.run(work, `work-${depth}`, 20));
+          yield* Effect.forkChild(chain(c, depth - 1));
           return `level ${depth}`;
         });
 
-  it.each([1, 3, 6])("catches every child down a fork chain %i deep", async (depth) => {
-    const inner = Registry.register("inner", (c: Context) => chain(c, depth));
+  it("waits for an unjoined fork made directly by the body", async () => {
+    const inner = Registry.register("inner", (c: Context) => chain(c, 0));
     const wf = Registry.register("wf", (ctx: Context) => ctx.run(inner));
     const { effect, server: s } = run([wf, inner, work], "wf", { latency: () => 20 });
 
-    const out = await Effect.runPromise(effect);
-    const awaited = out._tag === "Suspended" ? out.awaited : [];
+    expect(await Effect.runPromise(effect)).toEqual({ _tag: "Suspended", awaited: ["foo:1.2"] });
+    expect(s.promises.get("foo:1.1")?.state).toBe("resolved");
+  });
 
-    // The one remote call at the bottom is the only thing left outstanding.
-    expect(awaited).toHaveLength(1);
-    const orphans = [...s.promises.values()].filter(
-      (p) => p.state === "pending" && p.tags["resonate:target"] && !awaited.includes(p.id),
-    );
-    expect(orphans).toEqual([]);
+  // Pinned, not endorsed. A frame waits for its direct children only, and an
+  // Effect 4 fork is interruptible unless it asks otherwise: when an unjoined
+  // fork ends, Effect interrupts the forks *it* never joined. The work below it
+  // never happens and nothing records that it was meant to. If a later Effect
+  // release cascades again, this test is the one that says so.
+  it("cuts off a fork nested inside an unjoined fork", async () => {
+    const inner = Registry.register("inner", (c: Context) => chain(c, 1));
+    const wf = Registry.register("wf", (ctx: Context) => ctx.run(inner));
+    const { effect, server: s } = run([wf, inner, work], "wf", { latency: () => 20 });
 
-    // Every abandoned local child still ran and was recorded: one per level,
-    // plus the one at the bottom.
-    const settled = [...s.promises.values()].filter((p) => p.state === "resolved");
-    expect(settled).toHaveLength(depth + 1);
-  }, 30_000);
+    expect(await Effect.runPromise(effect)).toMatchObject({ _tag: "Completed", state: "resolved" });
+    // work-1 was the body's own fork and finished; the bottom level never ran.
+    expect([...s.promises.keys()]).toEqual(["foo:1", "foo:1.1"]);
+  });
+
+  it.each([1, 3, 6])(
+    "reaches every level of an Effect.all tree %i deep",
+    async (depth) => {
+      const inner = Registry.register("inner", (c: Context) => tree(c, depth));
+      const wf = Registry.register("wf", (ctx: Context) => ctx.run(inner));
+      const { effect, server: s } = run([wf, inner, work], "wf", { latency: () => 20 });
+
+      const out = await Effect.runPromise(effect);
+      const awaited = out._tag === "Suspended" ? out.awaited : [];
+
+      // The one remote call at the bottom is the only thing left outstanding.
+      expect(awaited).toHaveLength(1);
+      const orphans = [...s.promises.values()].filter(
+        (p) => p.state === "pending" && p.tags["resonate:target"] && !awaited.includes(p.id),
+      );
+      expect(orphans).toEqual([]);
+
+      // Every local child ran and was recorded: one per level,
+      // plus the one at the bottom.
+      const settled = [...s.promises.values()].filter((p) => p.state === "resolved");
+      expect(settled).toHaveLength(depth + 1);
+    },
+    30_000,
+  );
 });
 
 describe("borrowed contexts and retried calls", () => {
@@ -544,12 +597,12 @@ describe("borrowed contexts and retried calls", () => {
   it("does not re-create a durable call under Effect.retry", async () => {
     let attempts = 0;
     const flaky = Registry.register("flaky", (_c: Context) =>
-      Effect.sync(() => ++attempts).pipe(Effect.zipRight(Effect.fail("nope"))),
+      Effect.sync(() => ++attempts).pipe(Effect.andThen(Effect.fail("nope"))),
     );
     const wf = Registry.register("wf", (ctx: Context) =>
       ctx.run(flaky).pipe(
         Effect.retry({ times: 4 }),
-        Effect.catchAll(() => Effect.succeed("gave up")),
+        Effect.catch(() => Effect.succeed("gave up")),
       ),
     );
     const { effect, server: s } = run([wf, flaky], "wf");

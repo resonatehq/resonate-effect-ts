@@ -2,14 +2,66 @@
 
 A Resonate SDK built on [Effect](https://effect.website), speaking the
 [Resonate protocol](https://github.com/resonatehq/resonate-protocol)
-(version `2026-04-01`) to the Resonate server.
+(version `2026-04-01`) to the Resonate server. Requires Effect `4.0.5`.
 
-Built outside in: the protocol as data, the server as one method, the engine
-that runs the task loop, and the pass that runs the computation.
+Built outside in: the protocol as data, the server as one method and one
+stream, the engine that runs the task loop, and the pass that runs the
+computation. `Resonate.make` assembles all of it for one process.
 
 [ART.md](ART.md) is the laws any Resonate SDK has to satisfy, in no particular
 language. [MECHANICS.md](MECHANICS.md) is how this one satisfies them, stated
 flat. This file carries the reasoning.
+
+## Getting started
+
+A function is registered under a name, because the process that runs it is
+not necessarily the one that called it. The context is its first argument.
+
+```ts
+import { Effect } from "effect";
+import { type Context, Registry, Resonate } from "@resonatehq/effect";
+
+const fibonacci = Registry.register(
+  "fibonacci",
+  (ctx: Context.Context, n: number): Effect.Effect<number, unknown> =>
+    n < 2
+      ? Effect.succeed(n)
+      : Effect.map(
+          Effect.all([ctx.run(fibonacci, n - 1), ctx.rpc(fibonacci, n - 2)], { concurrency: "unbounded" }),
+          ([a, b]) => a + b,
+        ),
+);
+
+const program = Effect.gen(function* () {
+  const resonate = yield* Resonate.make({ url: "http://localhost:8001", group: "math", functions: [fibonacci] });
+  yield* resonate.start; // be a worker: run what the server dispatches here
+  return yield* resonate.run("fibonacci-10", fibonacci, 10);
+});
+
+console.log(await Effect.runPromise(Effect.scoped(program))); // 55
+```
+
+`ctx.run` runs a child here; `ctx.rpc` hands it to whichever worker in the
+group the server picks. `resonate.run` starts a root and drives it here;
+`resonate.rpc` starts one anywhere. Each is idempotent by id: running an id
+again returns what it recorded, and an id that already names a different call
+is refused.
+
+`make` is scoped. One heartbeat runs for the life of the scope, keeping alive
+every lease this process holds, and so does the worker `start` forks. Closing
+the scope stops both, and the leases lapse back to the server.
+
+Two complete examples, both runnable against `resonate dev` and both run by
+the test suite:
+
+```shell
+npm run example:fibonacci -- 10                            # run on even n, rpc on odd n
+npm run example:research -- "What is durable execution?"   # plan, fan out, report
+```
+
+`resonate.promises` and `resonate.schedules` reach the server from outside a
+workflow: create and settle the latent promise a workflow waits on, or run a
+function on a cron.
 
 ## The pieces
 
@@ -29,6 +81,12 @@ flat. This file carries the reasoning.
 | `src/ids.ts` | The Dewey id format the server validates against. |
 | `src/retries.ts` | Retry policies, as `Schedule`s. |
 | `src/correlation.ts` | Where `head.corrId` comes from. A service, so tests can make it deterministic. |
+| `src/messages.ts` | The server, the other way: `execute` and `unblock` as a stream. Server-sent events by default. |
+| `src/heartbeat.ts` | One loop per process, extending every lease it holds. |
+| `src/worker.ts` | Dispatch: `execute` messages into the engine, one fiber per task. |
+| `src/promises.ts` | Promises from outside a workflow: create, settle, search, wait. |
+| `src/schedules.ts` | Functions on a cron. |
+| `src/resonate.ts` | The front door: all of the above, assembled once per scope. |
 
 ## The engine
 
@@ -158,13 +216,31 @@ does. That is the whole of `executeUntilBlocked`:
 That last clause matters: a body that returns a value while a remote child is
 still outstanding suspends anyway, exactly as in the generator engine.
 
-**Concurrency is Effect's.** `Effect.all`, `Effect.forEach`, `Effect.fork` +
-`Fiber.join`. There is no `begin` variant, because forking a `ctx.rpc` and
-joining it later already is one. Fire-and-forget `fork` with no join is the one
-shape durable execution cannot express — the parent would settle over an
-outstanding promise — so every frame flushes: after its body returns it awaits
-the fibers it added, which is how an unjoined fork's edge still reaches the
-settle guard.
+**Concurrency is Effect's combinators.** Work that runs side by side goes in
+`Effect.all` or `Effect.forEach`:
+
+```ts
+const [quote, stock] = yield* Effect.all([ctx.rpc(pricing, order), ctx.run(reserve, order)], {
+  concurrency: "unbounded",
+})
+```
+
+That is the whole of it. Each call takes its id where it appears in the array,
+before anything runs, so the order is the source order on every pass; and the
+combinator joins every branch, so nothing is left running when the frame
+settles. Work meant to outlive the invocation is `ctx.detached`, which re-roots
+it so nothing here waits for it.
+
+**Join every fork.** Fire-and-forget `fork` is the one shape durable execution
+cannot express — the parent would settle over an outstanding promise. The SDK
+guards against it rather than supporting it: every frame flushes, awaiting
+after its body returns the fibers the body forked
+(`Effect.awaitAllChildren`), which is how an unjoined fork's edge still reaches
+the settle guard. That reaches one level. Effect 4 forks are interruptible
+unless they ask otherwise, so a fork that is itself never joined has the forks
+*it* never joined interrupted when it ends, and their work silently does not
+happen. `Effect.all` forks inherit the body's uninterruptibility and are not
+affected.
 
 `Effect.race` is the same shape, so racing gets its own operation:
 
@@ -187,10 +263,10 @@ order makes that stable, and the winner record makes it permanent.
 
 ### Three guards, and why the sentinel is not one of them
 
-The sentinel is opaque to every combinator that operates on `E` — `catchAll`,
-`catchTag`, `either`, `option`, `match`, `merge`, `orElse`, `retry`, `timeout`
+The sentinel is opaque to every combinator that operates on `E` — `catch`,
+`catchTag`, `result`, `option`, `match`, `orElseSucceed`, `retry`, `timeout`
 — and visible to the few that operate on a `Cause` or an `Exit`:
-`catchAllCause`, `catchAllDefect`, `sandbox`, `Effect.exit`, `Fiber.await`.
+`catchCause`, `catchDefect`, `sandbox`, `Effect.exit`, `Fiber.await`.
 Those cannot be hidden from; that is what they are for. So nothing rests on the
 opacity. Correctness comes from three checks the SDK owns:
 
@@ -204,6 +280,15 @@ opacity. Correctness comes from three checks the SDK owns:
    edge is refused *before* an id is minted, so a swallowed block cannot fork
    the id sequence and have the same id name a different call next pass.
 
+The prologue check is per fiber. It sees a block caught on the fiber that hit
+it, the common case and the one a sequential `Effect.all` produces. It does not
+see one caught on another fiber: a concurrent `Effect.all` whose failure the
+parent swallows with `Effect.exit`. Effect 3's `FiberRef` could spread the mark
+to the parent when it joined; Effect 4 has no join hook. Such a parent can mint
+on the diverged path, and the next pass, taking the real one, finds that
+record under the same id and stops with the diagnostic below rather than
+reading it.
+
 The blast radius of catching the sentinel is therefore some pure local code
 running and then stopping.
 
@@ -215,7 +300,7 @@ depend on timing — including every concurrent combinator, because the branches
 are constructed before any of them runs.
 
 It is not stable for a durable call built inside a callback that fires at a
-time-dependent point — a `catchAll` handler, a `forEach` body — while a
+time-dependent point — a `catch` handler, a `forEach` body — while a
 concurrent branch shares the same counter. Replay is faster than the first run,
 since settled children come back from the record instead of doing the work, so
 those callbacks can fire in a different order and two branches can swap
@@ -225,14 +310,15 @@ Pin those calls with an explicit id:
 
 ```ts
 ctx.run(failing).pipe(
-  Effect.catchAll(() => ctx.run(query, ["recovered", 400], { id: "recovered" })),
+  Effect.catch(() => ctx.run(query, ["recovered", 400], { id: "recovered" })),
 )
 ```
 
 Every dedup is checked against the call being made — the encoded parameters of
-the promise that came back must match the ones this code would have sent — so
-an id taken twice stops the pass with a diagnostic instead of quietly returning
-another branch's value. The check cannot make such a workflow correct; only the
+the promise that came back must match the ones this code would have sent, for
+a promise still pending as much as for a settled one — so an id taken twice
+stops the pass with a diagnostic instead of quietly returning another branch's
+value, or awaiting it. The check cannot make such a workflow correct; only the
 explicit id does that.
 
 ### Two properties worth knowing
@@ -268,14 +354,10 @@ next pass.
 
 ## Not yet here
 
-- **Heartbeating.** A lease has a ttl and nothing extends it yet. `task.heartbeat`
-  covers every task a pid holds at once, so it belongs to a process-wide
-  component beside the engine rather than inside `process`.
-- **Dispatch.** Something has to receive `execute` messages and hand them to the
-  engine. `Engine.fromExecuteMsg` is the adapter; the poller/listener is not
-  written.
-- **A `Resonate` front door.** Registering workflows, `run`/`rpc` from outside a
-  workflow, schedules. Everything under it exists; nothing assembles it yet.
+- **Listening instead of polling.** Waiting on a result from outside a workflow
+  asks `promise.get` every `pollInterval`, woken early when this process drove
+  the root itself. `promise.register_listener` and the `unblock` message would
+  replace the polling; the worker already receives `unblock` and drops it.
 - **Schema-typed registration.** The codec is JSON today, so a typed `E` round
   trips as data rather than as itself. Deriving the codec from an
   `effect/Schema` per registered function is the natural next layer.
@@ -283,6 +365,23 @@ next pass.
   losing branches were blocked on. A losing branch that blocked *below* a local
   child leaves that intermediate promise pending until it times out — inert,
   since nothing is running it, but untidy.
+
+## Against a real server
+
+The suite runs the outer layer end to end on an in-memory server
+(`tests/fake-server.ts`). `tests/live-server.test.ts` runs both examples against
+a real one when `RESONATE_LIVE_URL` is set:
+
+```shell
+resonate dev                                        # or: resonate serve (SQLite)
+RESONATE_LIVE_URL=http://localhost:8001 npm test
+```
+
+Checked against Resonate Server 0.10.1, with both `serve` (SQLite) and `dev`:
+both examples, a function running past its lease kept alive by the heartbeat,
+a rerun of a finished id returning its recorded result without executing, and
+a worker killed mid-workflow whose task another process picked up when the
+lease lapsed, replaying the recorded step rather than redoing it.
 
 ## Development
 
@@ -292,9 +391,11 @@ npm run build        # tsc -> dist/
 npm run type-check
 npm test             # vitest
 npm run check        # biome
+npm run validate     # all four
 ```
 
-Requires Node >= 22.
+Requires Node >= 22 and Effect 4.0.5. The SDK itself uses only web-standard
+APIs (`fetch`, streams, `TextEncoder`, `crypto.randomUUID`).
 
 `src/protocol.ts` is vendored, not authored: resync it from
 `resonate-protocol/spec/types-raw.ts` rather than editing it in place.

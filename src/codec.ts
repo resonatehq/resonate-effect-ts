@@ -20,10 +20,18 @@ export interface CodecService {
   readonly decode: (value: Value | undefined) => Effect.Effect<unknown, CodecError>;
 }
 
-export class Codec extends Context.Tag("@resonatehq/effect/Codec")<Codec, CodecService>() {}
+export class Codec extends Context.Service<Codec, CodecService>()("@resonatehq/effect/Codec") {}
 
-const b64encode = (s: string) => Buffer.from(s, "utf8").toString("base64");
-const b64decode = (s: string) => Buffer.from(s, "base64").toString("utf8");
+// Web-standard rather than Buffer, so the SDK runs wherever `fetch` does. The
+// bytes are the same: base64 over the UTF-8 encoding of the JSON text.
+const utf8 = new TextEncoder();
+const utf8Decoder = new TextDecoder();
+const b64encode = (s: string) => {
+  let binary = "";
+  for (const byte of utf8.encode(s)) binary += String.fromCharCode(byte);
+  return btoa(binary);
+};
+const b64decode = (s: string) => utf8Decoder.decode(Uint8Array.from(atob(s), (c) => c.charCodeAt(0)));
 
 // Infinity and Error survive the round trip; JSON has no native form for either.
 const INF = "__INF__";

@@ -79,7 +79,7 @@ export interface ExecutorService {
   readonly executeUntilBlocked: (invocation: Invocation) => Effect.Effect<Execution, ExecutorError>;
 }
 
-export class Executor extends Context.Tag("@resonatehq/effect/Executor")<Executor, ExecutorService>() {}
+export class Executor extends Context.Service<Executor, ExecutorService>()("@resonatehq/effect/Executor") {}
 
 /** Run one pass with the ambient executor. */
 export const executeUntilBlocked = (invocation: Invocation): Effect.Effect<Execution, ExecutorError, Executor> =>

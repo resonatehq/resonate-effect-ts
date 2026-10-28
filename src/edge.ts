@@ -8,9 +8,9 @@ import { Cause, Data, Effect } from "effect";
 // the edge of what this process can do. Reaching one is not a failure of the
 // user's program, so it must not appear in its error type or be reachable by
 // its error handling. It travels as a defect: opaque to every combinator that
-// operates on `E` (`catchAll`, `catchTag`, `either`, `option`, `match`,
-// `merge`, `orElse`, `retry`, `timeout`, ...), and visible only to the ones
-// that operate on a `Cause` or an `Exit` (`catchAllCause`, `catchAllDefect`,
+// operates on `E` (`catch`, `catchTag`, `result`, `option`, `match`,
+// `orElseSucceed`, `retry`, `timeout`, ...), and visible only to the ones
+// that operate on a `Cause` or an `Exit` (`catchCause`, `catchDefect`,
 // `sandbox`, `Effect.exit`, `Fiber.await`).
 //
 // Those last few cannot be hidden from — that is what they are for — so nothing
@@ -44,7 +44,11 @@ export const reach = (id: string): Effect.Effect<never> => Effect.die(new Edge({
 export const reraise = (edge: Edge): Effect.Effect<never> => Effect.die(edge);
 
 /** The edges named by a cause, if any. */
-export const of = (cause: Cause.Cause<unknown>): ReadonlyArray<Edge> => [...Cause.defects(cause)].filter(isEdge);
+export const of = (cause: Cause.Cause<unknown>): ReadonlyArray<Edge> => defects(cause).filter(isEdge);
+
+/** Every defect a cause carries, in order. */
+export const defects = (cause: Cause.Cause<unknown>): ReadonlyArray<unknown> =>
+  cause.reasons.filter(Cause.isDieReason).map((reason) => reason.defect);
 
 /** The first edge named by a cause. */
 export const first = (cause: Cause.Cause<unknown>): Edge | undefined => of(cause)[0];
@@ -59,7 +63,7 @@ export const first = (cause: Cause.Cause<unknown>): Edge | undefined => of(cause
 // A failed write — a rate limit, a timeout, a 500, a lost connection — says
 // nothing about the computation. It has not failed; it has not been run. If
 // such a failure reaches the workflow's error channel it becomes
-// indistinguishable from a domain error: the user's `catchAll` swallows a 429
+// indistinguishable from a domain error: the user's `catch` swallows a 429
 // as a business failure and durably records the compensation, or it reaches the
 // root and gets written as the workflow's permanent result. Neither is
 // recoverable — a fulfilled task is immutable.
@@ -82,4 +86,4 @@ export const unavailable = (cause: unknown): Effect.Effect<never> => Effect.die(
 
 /** The first unavailability named by a cause, if any. */
 export const firstUnavailable = (cause: Cause.Cause<unknown>): Unavailable | undefined =>
-  [...Cause.defects(cause)].filter(isUnavailable)[0];
+  defects(cause).filter(isUnavailable)[0];

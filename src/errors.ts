@@ -43,3 +43,13 @@ export const serverError = (res: Response): ServerError =>
     // Every non-200/300 response carries its description in `data` as a string.
     message: typeof res.data === "string" ? res.data : `${res.kind} failed with status ${res.head.status}`,
   });
+
+/** The promise was settled as cancelled: someone stopped waiting for it. */
+export class Canceled extends Data.TaggedError("Canceled")<{
+  readonly id: string;
+}> {}
+
+/** The promise reached its `timeoutAt` before anything settled it. */
+export class TimedOut extends Data.TaggedError("TimedOut")<{
+  readonly id: string;
+}> {}

@@ -63,9 +63,9 @@ export interface Handle<A, E = never> {
 /** Anything nameable: a registration (typed) or a bare name (not). */
 export type Callable<F extends Workflow = Workflow> = Registration<F> | string;
 
-type Args<F> = F extends (ctx: any, ...args: infer P) => any ? P : never[];
-type Ok<F> = F extends (ctx: any, ...args: any[]) => Effect.Effect<infer A, any, any> ? A : never;
-type Err<F> = F extends (ctx: any, ...args: any[]) => Effect.Effect<any, infer E, any> ? E : never;
+export type Args<F> = F extends (ctx: any, ...args: infer P) => any ? P : never[];
+export type Ok<F> = F extends (ctx: any, ...args: any[]) => Effect.Effect<infer A, any, any> ? A : never;
+export type Err<F> = F extends (ctx: any, ...args: any[]) => Effect.Effect<any, infer E, any> ? E : never;
 
 /**
  * The durable operations.
@@ -307,18 +307,7 @@ export const make = (pass: Pass, frame: Frame): Context => {
   const resolve = (fn: Callable, version: number): Registration | undefined =>
     typeof fn === "string" ? pass.registry.get(fn, version) : fn;
 
-  // Split `(fn, ...args)` from `(fn, args, opts)`. A trailing options object is
-  // also honoured on its own, which is how the no-argument operations —
-  // `promise`, `detached` — carry one.
-  const split = (rest: unknown[]): { args: unknown[]; opts: Options } => {
-    if (rest.length === 2 && Array.isArray(rest[0]) && isOptions(rest[1])) {
-      return { args: rest[0] as unknown[], opts: rest[1] as Options };
-    }
-    if (rest.length > 0 && isOptions(rest[rest.length - 1])) {
-      return { args: rest.slice(0, -1), opts: rest[rest.length - 1] as Options };
-    }
-    return { args: rest, opts: {} };
-  };
+  const split = splitArgs;
 
   const replay = (record: PromiseRecord): Effect.Effect<any, any> =>
     Effect.flatMap(pass.codec.decode(record.value), (value) =>
@@ -826,6 +815,21 @@ const CurrentFrame = EffectContext.Reference<string | undefined>("@resonatehq/ef
 /** Run `body` as the work of frame `id`. */
 export const within = <A, E, R>(id: string, body: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
   Effect.provideService(body, CurrentFrame, id);
+
+/**
+ * Split `(fn, ...args)` from `(fn, args, opts)`. A trailing options object is
+ * also honoured on its own, which is how the no-argument operations —
+ * `promise`, `detached` — carry one.
+ */
+export const splitArgs = (rest: unknown[]): { args: unknown[]; opts: Options } => {
+  if (rest.length === 2 && Array.isArray(rest[0]) && isOptions(rest[1])) {
+    return { args: rest[0] as unknown[], opts: rest[1] as Options };
+  }
+  if (rest.length > 0 && isOptions(rest[rest.length - 1])) {
+    return { args: rest.slice(0, -1), opts: rest[rest.length - 1] as Options };
+  }
+  return { args: rest, opts: {} };
+};
 
 const isOptions = (u: unknown): u is Options =>
   typeof u === "object" &&

@@ -63,14 +63,14 @@ const wild = Registry.register("wild", (ctx: Context) =>
       ctx.run(level1),
       // forked, non-durable work in between, joined after
       Effect.gen(function* () {
-        const f = yield* Effect.fork(ctx.run(query, "forked", 800));
+        const f = yield* Effect.forkChild(ctx.run(query, "forked", 800));
         yield* wait(200);
         return yield* Fiber.join(f);
       }),
       // a child that fails, recovered by another child started from the handler
       // Built inside a catch handler, so *when* it is constructed depends on
       // timing. Pinned, or it would take whatever number the counter is at.
-      ctx.run(failing).pipe(Effect.catchAll(() => ctx.run(query, ["recovered", 400], { id: "wild-recovered" }))),
+      ctx.run(failing).pipe(Effect.catch(() => ctx.run(query, ["recovered", 400], { id: "wild-recovered" }))),
       // a batch, each element its own durable child
       // Same: built inside a forEach body, so pinned too.
       Effect.forEach([300, 500, 700], (ms) => ctx.run(query, [`each${ms}`, ms], { id: `wild-each${ms}` }), {
@@ -201,7 +201,7 @@ describe("an id taken twice is caught, not silently obeyed", () => {
   const drifting = Registry.register("drifting", (ctx: Context) =>
     Effect.all(
       [
-        ctx.run(failing).pipe(Effect.catchAll(() => ctx.run(query, "recovered", 10))),
+        ctx.run(failing).pipe(Effect.catch(() => ctx.run(query, "recovered", 10))),
         Effect.forEach([20, 30], (ms) => ctx.run(query, `each${ms}`, ms), { concurrency: "unbounded" }),
       ],
       { concurrency: "unbounded" },

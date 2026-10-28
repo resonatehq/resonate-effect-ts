@@ -1,4 +1,4 @@
-import { Cause, Clock, Deferred, Effect, Exit, Fiber, FiberId, FiberRef, identity } from "effect";
+import { Cause, Clock, Deferred, Effect, Context as EffectContext, Exit, type Fiber, identity, Result } from "effect";
 import type { CodecService } from "./codec.js";
 import * as Edge from "./edge.js";
 import * as Ids from "./ids.js";
@@ -230,8 +230,8 @@ export const edgesOf = (frame: Frame): ReadonlyArray<string> => [...frame.edges]
 
 const claim = (frame: Frame): { ready: Effect.Effect<void>; release: () => void } => {
   const ready = frame.tail;
-  const gate = Deferred.unsafeMake<void>(FiberId.none);
-  const release = () => Deferred.unsafeDone(gate, Effect.void);
+  const gate = Deferred.makeUnsafe<void>();
+  const release = () => Deferred.doneUnsafe(gate, Effect.void);
   frame.tail = Deferred.await(gate);
   frame.gates.push(release);
   return { ready, release };
@@ -347,8 +347,8 @@ export const make = (pass: Pass, frame: Frame): Context => {
     const expected = sent.data.param?.data;
     if (found === undefined || found === expected) return Effect.void;
     const describe = (v: { data?: string } | undefined) =>
-      Effect.map(Effect.either(pass.codec.decode(v)), (d) =>
-        d._tag === "Right" ? JSON.stringify(d.right) : "<undecodable>",
+      Effect.map(Effect.result(pass.codec.decode(v)), (d) =>
+        Result.isSuccess(d) ? JSON.stringify(d.success) : "<undecodable>",
       );
     return Effect.flatMap(describe(record.param), (was) =>
       Effect.flatMap(describe(sent.data.param), (now) =>
@@ -384,13 +384,13 @@ export const make = (pass: Pass, frame: Frame): Context => {
         yield* slot.ready;
         // This path already caught an edge, so it is running on a value this
         // pass never produced. Refuse before anything durable happens.
-        if (yield* FiberRef.get(caughtEdge)) return yield* diverged(op);
+        if (yield* caughtEdge) return yield* diverged(op);
         // This context belongs to a different invocation than the one running.
-        const executing = yield* FiberRef.get(currentFrame);
+        const executing = yield* CurrentFrame;
         if (executing !== undefined && executing !== frame.id) return yield* foreign(op, executing);
 
         const sent = yield* req;
-        const record = yield* Effect.catchAll(pass.store.create(sent), Edge.unavailable);
+        const record = yield* Effect.catch(pass.store.create(sent), Edge.unavailable);
         // A record that came back settled is one this pass did not create. It
         // has to be the same call, or an id was reused.
         if (record.state !== "pending") yield* sameCall(record, sent);
@@ -479,9 +479,9 @@ export const make = (pass: Pass, frame: Frame): Context => {
           yield* settle(id, "resolved", exit.value);
           return exit.value;
         }
-        if (Cause.isInterruptedOnly(exit.cause)) return yield* Effect.failCause(exit.cause);
+        if (Cause.hasInterruptsOnly(exit.cause)) return yield* Effect.failCause(exit.cause);
 
-        const failure = Cause.failureOption(exit.cause);
+        const failure = Cause.findErrorOption(exit.cause);
         const error = failure._tag === "Some" ? failure.value : squash(exit.cause);
         yield* settle(id, "rejected", error);
         return yield* Effect.fail(error);
@@ -493,11 +493,11 @@ export const make = (pass: Pass, frame: Frame): Context => {
     Effect.flatMap(pass.codec.encode(value), (encoded) =>
       // A write that did not land is not a result. Encoding failures are the
       // same: the value cannot be recorded, so nothing may be concluded from it.
-      Effect.catchAll(
+      Effect.catch(
         pass.store.settle({ kind: "promise.settle", head: head(), data: { id, state, value: encoded } }),
         Edge.unavailable,
       ),
-    ).pipe(Effect.catchAll(Edge.unavailable));
+    ).pipe(Effect.catch(Edge.unavailable));
 
   // --- race: a local frame whose promise records the winner ----------------
   const race = (
@@ -556,19 +556,15 @@ export const make = (pass: Pass, frame: Frame): Context => {
         // Every branch runs to its own end — a value, a typed failure, or its
         // edge. Nothing is interrupted, so there are no torn creates to reason
         // about, and the branch ids come out in declaration order.
-        // Race looks at how its branches ended, edges included, so its own
-        // continuation is not on a caught path — but only its own. Scoped, or
-        // it would disable the divergence check for the rest of the frame.
-        const exits = yield* Effect.locally(
-          Effect.ensuring(
-            Effect.all(
-              arenas.map(({ branch, frame: branchFrame }) => withFlush(within(id, branch(make(pass, branchFrame))))),
-              { concurrency: "unbounded" },
-            ),
-            closeFrame(arena),
+        // Race looks at how its branches ended, edges included. Each branch
+        // runs on its own fiber, so a branch that blocks marks that fiber and
+        // not this one: the race's own continuation is not on a caught path.
+        const exits = yield* Effect.ensuring(
+          Effect.all(
+            arenas.map(({ branch, frame: branchFrame }) => withFlush(within(id, branch(make(pass, branchFrame))))),
+            { concurrency: "unbounded" },
           ),
-          caughtEdge,
-          false,
+          closeFrame(arena),
         );
 
         // A winner is a branch that produced a value AND is not itself blocked.
@@ -603,13 +599,13 @@ export const make = (pass: Pass, frame: Frame): Context => {
         }
         if (outstanding > 0) return yield* Edge.reach(id);
 
-        const interrupted = exits.find((e) => Exit.isFailure(e) && Cause.isInterruptedOnly(e.cause));
+        const interrupted = exits.find((e) => Exit.isFailure(e) && Cause.hasInterruptsOnly(e.cause));
         if (interrupted) return yield* Effect.failCause((interrupted as Exit.Failure<never, never>).cause);
 
         // Every branch failed: the race failed. First failure by declaration
         // order, so the recorded rejection is the same on every run.
         const first = exits[0] as Exit.Failure<never, unknown>;
-        const failure = Cause.failureOption(first.cause);
+        const failure = Cause.findErrorOption(first.cause);
         const error = failure._tag === "Some" ? failure.value : squash(first.cause);
         yield* settle(id, "rejected", error);
         return yield* Effect.fail(error);
@@ -699,7 +695,7 @@ export const make = (pass: Pass, frame: Frame): Context => {
           // Already recorded when it was created; awaiting is what stops the
           // fiber, and what marks this path as having reached an edge.
           frame.edges.add(id);
-          return Effect.zipRight(FiberRef.set(caughtEdge, true), Edge.reach(id));
+          return Effect.andThen(markCaughtEdge, Edge.reach(id));
         });
 
   // One region from claiming the chain slot to recording the edge. `remote` is
@@ -753,70 +749,58 @@ const mint = (frame: Frame): string => Ids.join(frame.id, frame.counter.n++);
  * A frame does not finish while work it spawned is still running.
  *
  * `ctx.run` awaits the body, and the body's own combinators join whatever they
- * fork — but an `Effect.fork` the body never joins is attached to the fiber, not
- * to any combinator, and nothing else waits for it. Without this the frame
- * settles its promise while a child it started is still in flight, and a remote
- * one is then live with nobody awaiting it: a workflow that completed over an
- * outstanding call.
+ * fork — but an `Effect.forkChild` the body never joins is attached to the
+ * fiber, not to any combinator, and nothing else waits for it. Without this the
+ * frame settles its promise while a child it started is still in flight, and a
+ * remote one is then live with nobody awaiting it: a workflow that completed
+ * over an outstanding call.
  *
- * Only fibers this frame added are awaited, not ones the caller already had
- * running, so a frame never waits on a sibling that might be waiting on it.
- * This is the generator engine's `flushLocalWork`, and it is what lets the
- * settle guard see a forked child's edge.
+ * `Effect.awaitAllChildren` is exactly that wait: the fibers the body forked,
+ * not ones the caller already had running, so a frame never waits on a sibling
+ * that might be waiting on it. This is the generator engine's
+ * `flushLocalWork`, and it is what lets the settle guard see a forked child's
+ * edge.
+ *
+ * It reaches direct children only. Effect 4 forks are interruptible unless
+ * they ask otherwise, so an unjoined fork that itself forks and never joins
+ * has that inner fiber interrupted when it ends — between two durable calls,
+ * never in the middle of one. Fan-out belongs in `Effect.all` and
+ * `Effect.forEach`, which join every branch; work that outlives the
+ * invocation belongs in `ctx.detached`.
  */
-const running = Effect.withFiberRuntime<ReadonlyArray<Fiber.RuntimeFiber<unknown, unknown>>, never, never>((self) =>
-  Effect.succeed([
-    ...((self as unknown as { getChildren(): Set<Fiber.RuntimeFiber<unknown, unknown>> }).getChildren() ?? new Set()),
-  ]),
-);
-
-/**
- * Direct children are enough, by induction — but only because the body runs
- * uninterruptible.
- *
- * On its own, awaiting a fiber does not wait for its children: it returns as
- * soon as that fiber is done and leaves them running (measured: 5ms to await a
- * parent whose 80ms child had not finished). Inside an uninterruptible region
- * it does. A completing fiber interrupts its children and waits for that
- * interruption to land; deferred, so "interrupt and wait" becomes "wait until
- * they finish" — 81ms for the same shape, child finished. Completion therefore
- * already cascades, and each child covers its own subtree.
- *
- * The two are coupled: make the body interruptible again and this quietly stops
- * reaching past one level.
- */
-const flush = (before: ReadonlyArray<Fiber.RuntimeFiber<unknown, unknown>>) =>
-  Effect.flatMap(running, (now) => Fiber.awaitAll(now.filter((fiber) => !before.includes(fiber))));
-
-/** Run `body`, then wait for anything it forked and left behind. */
 export const withFlush = <A, E, R>(body: Effect.Effect<A, E, R>): Effect.Effect<Exit.Exit<A, E>, never, R> =>
-  Effect.gen(function* () {
-    const before = yield* running;
-    const exit = yield* Effect.exit(body);
-    yield* flush(before);
-    return exit;
-  });
+  Effect.awaitAllChildren(Effect.exit(body));
 
 /** What a race promise records as its function. It has no code behind it. */
 const RACE = "resonate:race";
 
 /**
- * Set on the way to an edge, and read before every durable write.
+ * Fibers that reached an edge, read before every durable write.
  *
  * A fiber that reached an edge is dead, so the only way to still be executing
- * in one is that something caught the sentinel. A `FiberRef` rather than a flag
- * on the frame, because the frame is shared by concurrent siblings and they are
- * not on this path: a branch that recovers from a failure with
- * `catchAll(() => ctx.run(...))` while a *sibling* branch happens to be blocked
- * is doing nothing wrong, and keying the check on the frame refuses it.
+ * in one is that something caught the sentinel. Keyed by fiber rather than by
+ * frame, because the frame is shared by concurrent siblings and they are not
+ * on this path: a branch that recovers from a failure with
+ * `catch(() => ctx.run(...))` while a *sibling* branch happens to be blocked is
+ * doing nothing wrong, and keying the check on the frame refuses it.
+ *
+ * Not a context value: Effect 4 restores a fiber's whole context when a
+ * provided region exits, so a mark set inside a frame would be gone by the
+ * time the code that caught the edge — outside that frame — reads it.
+ *
+ * What this cannot see is a block caught on a *different* fiber: a concurrent
+ * `Effect.all` whose failure the parent swallows with `Effect.exit`. Effect 3's
+ * `FiberRef` could spread the mark on join; Effect 4 has no join hook. Such a
+ * parent is not refused here, and an id it mints on the diverged path is
+ * caught on the next pass by the call check in `create`, loudly.
  */
-const caughtEdge = FiberRef.unsafeMake(false, {
-  // Explicit join semantics. The default is "child wins", which here would mean
-  // a poisoned fiber quietly *un*poisoning itself the moment it joined a clean
-  // child — one `Effect.all` of untainted work and the check is gone. Poison
-  // only ever spreads: a fiber that caught an edge stays caught, and one that
-  // joins a fiber which caught one has itself continued past a block.
-  join: (parent, child) => parent || child,
+const caughtEdges = new WeakSet<Fiber.Fiber<unknown, unknown>>();
+
+const caughtEdge: Effect.Effect<boolean> = Effect.withFiber((fiber) => Effect.succeed(caughtEdges.has(fiber)));
+
+const markCaughtEdge: Effect.Effect<void> = Effect.withFiber((fiber) => {
+  caughtEdges.add(fiber);
+  return Effect.void;
 });
 
 /**
@@ -829,15 +813,16 @@ const caughtEdge = FiberRef.unsafeMake(false, {
  * being advanced from a place whose ordering the outer frame does not control.
  * So it is refused rather than named wrongly.
  *
- * `join: (parent) => parent` for the same reason as above, and more sharply: the
- * default would have a frame adopt a joined child's identity, so every call
- * after the first `Effect.all` would look foreign.
+ * A context reference, which is the semantics this needs: forked fibers
+ * inherit it, and joining one never hands its value back to the parent.
  */
-const currentFrame = FiberRef.unsafeMake<string | undefined>(undefined, { join: (parent) => parent });
+const CurrentFrame = EffectContext.Reference<string | undefined>("@resonatehq/effect/CurrentFrame", {
+  defaultValue: () => undefined,
+});
 
 /** Run `body` as the work of frame `id`. */
 export const within = <A, E, R>(id: string, body: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
-  Effect.locally(body, currentFrame, id);
+  Effect.provideService(body, CurrentFrame, id);
 
 const isOptions = (u: unknown): u is Options =>
   typeof u === "object" &&
@@ -846,7 +831,7 @@ const isOptions = (u: unknown): u is Options =>
   ["id", "target", "timeout", "tags", "version", "retry"].some((k) => k in (u as object));
 
 const squash = (cause: Cause.Cause<unknown>): unknown => {
-  const defect = [...Cause.defects(cause)][0];
+  const defect = Edge.defects(cause)[0];
   return defect ?? new Error(Cause.pretty(cause));
 };
 

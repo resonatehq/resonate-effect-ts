@@ -5,10 +5,9 @@ import { Context, Effect, Layer } from "effect";
  * be matched to its request. A service rather than a bare call to
  * `crypto.randomUUID()` so a test can make correlation ids deterministic.
  */
-export class Correlation extends Context.Tag("@resonatehq/effect/Correlation")<
-  Correlation,
-  { readonly next: Effect.Effect<string> }
->() {}
+export class Correlation extends Context.Service<Correlation, { readonly next: Effect.Effect<string> }>()(
+  "@resonatehq/effect/Correlation",
+) {}
 
 /** The next correlation id. */
 export const next: Effect.Effect<string, never, Correlation> = Effect.flatMap(Correlation, (c) => c.next);

@@ -44,7 +44,11 @@ export const reach = (id: string): Effect.Effect<never> => Effect.die(new Edge({
 export const reraise = (edge: Edge): Effect.Effect<never> => Effect.die(edge);
 
 /** The edges named by a cause, if any. */
-export const of = (cause: Cause.Cause<unknown>): ReadonlyArray<Edge> => [...Cause.defects(cause)].filter(isEdge);
+export const of = (cause: Cause.Cause<unknown>): ReadonlyArray<Edge> => defects(cause).filter(isEdge);
+
+/** Every defect a cause carries, in order. */
+export const defects = (cause: Cause.Cause<unknown>): ReadonlyArray<unknown> =>
+  cause.reasons.filter(Cause.isDieReason).map((reason) => reason.defect);
 
 /** The first edge named by a cause. */
 export const first = (cause: Cause.Cause<unknown>): Edge | undefined => of(cause)[0];
@@ -82,4 +86,4 @@ export const unavailable = (cause: unknown): Effect.Effect<never> => Effect.die(
 
 /** The first unavailability named by a cause, if any. */
 export const firstUnavailable = (cause: Cause.Cause<unknown>): Unavailable | undefined =>
-  [...Cause.defects(cause)].filter(isUnavailable)[0];
+  defects(cause).filter(isUnavailable)[0];

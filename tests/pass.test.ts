@@ -158,7 +158,7 @@ describe("ctx.rpc — the edge", () => {
   it("suspends even when the body returned, if a remote child is outstanding", async () => {
     const forgetful = Registry.register("forgetful", (ctx: Context) =>
       Effect.gen(function* () {
-        yield* Effect.fork(ctx.rpc("remote"));
+        yield* Effect.forkChild(ctx.rpc("remote"));
         yield* Effect.sleep("30 millis"); // let the fork reach its edge
         return "returned anyway";
       }),

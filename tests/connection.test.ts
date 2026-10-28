@@ -51,7 +51,7 @@ describe("Connection.http", () => {
   it("sends the token as a header and on the head", async () => {
     const fetch = stubFetch(envelope(200, { promise: null }));
 
-    await Effect.runPromise(Effect.either(send({ token: "t0ken" })));
+    await Effect.runPromise(Effect.result(send({ token: "t0ken" })));
 
     const [, init] = fetch.mock.calls[0] as unknown as [string, RequestInit];
     expect((init.headers as Record<string, string>).Authorization).toBe("Bearer t0ken");

@@ -26,7 +26,7 @@ export interface RegistryService {
   readonly get: (name: string, version?: number) => Registration | undefined;
 }
 
-export class Registry extends Context.Tag("@resonatehq/effect/Registry")<Registry, RegistryService>() {}
+export class Registry extends Context.Service<Registry, RegistryService>()("@resonatehq/effect/Registry") {}
 
 /** Look a function up, failing rather than returning undefined. */
 export const lookup = (name: string, version = 0): Effect.Effect<Registration, NotRegistered, Registry> =>

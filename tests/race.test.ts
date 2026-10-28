@@ -154,7 +154,7 @@ describe("a race decides on what a branch actually did", () => {
     // answer is a fabrication.
     const cheat = Registry.register("cheat", (ctx: Context) =>
       ctx.race([
-        (c) => c.run(blocked).pipe(Effect.catchAllCause(() => Effect.succeed("FABRICATED"))),
+        (c) => c.run(blocked).pipe(Effect.catchCause(() => Effect.succeed("FABRICATED"))),
         (c) => c.rpc("real"),
       ]),
     );

@@ -47,7 +47,7 @@ describe("a write that did not land is never a result", () => {
     // The shape that makes this unrecoverable: a user compensating for what
     // they think is a domain error, and durably recording the compensation.
     const wf = Registry.register("wf", (ctx: Context) =>
-      ctx.run(leaf, 1).pipe(Effect.catchAll(() => Effect.succeed("COMPENSATED"))),
+      ctx.run(leaf, 1).pipe(Effect.catch(() => Effect.succeed("COMPENSATED"))),
     );
     const { effect, server: s } = go([wf, leaf], "wf", (req) => (req.kind === "task.fence" ? 429 : undefined));
 

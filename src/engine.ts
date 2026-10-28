@@ -111,7 +111,7 @@ export interface EngineService {
   readonly process: (task: Task) => Effect.Effect<Outcome, EngineError>;
 }
 
-export class Engine extends Context.Tag("@resonatehq/effect/Engine")<Engine, EngineService>() {}
+export class Engine extends Context.Service<Engine, EngineService>()("@resonatehq/effect/Engine") {}
 
 type Requirements = Connection.Connection | Correlation.Correlation | Executor.Executor;
 

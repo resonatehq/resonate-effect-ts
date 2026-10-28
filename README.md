@@ -358,9 +358,6 @@ next pass.
   asks `promise.get` every `pollInterval`, woken early when this process drove
   the root itself. `promise.register_listener` and the `unblock` message would
   replace the polling; the worker already receives `unblock` and drops it.
-- **Verified against a live server here.** The outer layer is exercised end to
-  end on an in-memory server (`tests/fake-server.ts`). `tests/live-server.test.ts`
-  runs both examples against a real one when `RESONATE_LIVE_URL` is set.
 - **Schema-typed registration.** The codec is JSON today, so a typed `E` round
   trips as data rather than as itself. Deriving the codec from an
   `effect/Schema` per registered function is the natural next layer.
@@ -368,6 +365,23 @@ next pass.
   losing branches were blocked on. A losing branch that blocked *below* a local
   child leaves that intermediate promise pending until it times out — inert,
   since nothing is running it, but untidy.
+
+## Against a real server
+
+The suite runs the outer layer end to end on an in-memory server
+(`tests/fake-server.ts`). `tests/live-server.test.ts` runs both examples against
+a real one when `RESONATE_LIVE_URL` is set:
+
+```shell
+resonate dev                                        # or: resonate serve (SQLite)
+RESONATE_LIVE_URL=http://localhost:8001 npm test
+```
+
+Checked against Resonate Server 0.10.1, with both `serve` (SQLite) and `dev`:
+both examples, a function running past its lease kept alive by the heartbeat,
+a rerun of a finished id returning its recorded result without executing, and
+a worker killed mid-workflow whose task another process picked up when the
+lease lapsed, replaying the recorded step rather than redoing it.
 
 ## Development
 

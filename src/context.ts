@@ -391,9 +391,12 @@ export const make = (pass: Pass, frame: Frame): Context => {
 
         const sent = yield* req;
         const record = yield* Effect.catch(pass.store.create(sent), Edge.unavailable);
-        // A record that came back settled is one this pass did not create. It
-        // has to be the same call, or an id was reused.
-        if (record.state !== "pending") yield* sameCall(record, sent);
+        // Whatever came back — the promise just created, or one an earlier
+        // pass left, settled or still pending — has to be the same call, or an
+        // id was reused. A pending one counts as much as a settled one: two
+        // outstanding calls that swapped ids would otherwise each be awaited
+        // under the other's id, and their results would land crosswise.
+        yield* sameCall(record, sent);
         return record;
       }),
       Effect.sync(slot.release),

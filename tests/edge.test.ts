@@ -178,6 +178,32 @@ describe("the guards", () => {
     expect([...s.promises.keys()]).toEqual(["foo:1"]);
   });
 
+  // Pinned, not endorsed. Here the block happens on a concurrent child fiber
+  // and the parent swallows it. Effect 3's FiberRef spread the mark to the
+  // parent on join; Effect 4 has no join hook, so the parent is not refused and
+  // mints on the diverged path. What still holds: the frame does not settle,
+  // and the next pass, taking the real path, finds the stale record under the
+  // same id and stops with a diagnostic instead of reading it.
+  it("catches a block swallowed across fibers on the next pass", async () => {
+    const diverge = Registry.register("diverge", (ctx: Context) =>
+      Effect.gen(function* () {
+        const exit = yield* Effect.all([ctx.rpc("a")], { concurrency: "unbounded" }).pipe(Effect.exit);
+        return yield* exit._tag === "Failure" ? ctx.rpc("fallback") : ctx.rpc("b");
+      }),
+    );
+    const { effect, server: s } = run([diverge], "diverge");
+
+    expect(await Effect.runPromise(effect)).toEqual({ _tag: "Suspended", awaited: ["foo:1", "foo:2"] });
+    s.settleExternally("foo:1", "a's answer");
+
+    const out = await Effect.runPromise(effect);
+
+    expect(out).toMatchObject({ _tag: "Completed", state: "rejected" });
+    expect(String((decodeValue(out) as Error).message)).toContain(
+      "promise 'foo:2' already exists and holds a different call",
+    );
+  });
+
   it("lets the error channel through untouched", async () => {
     const handled = Registry.register("handled", (ctx: Context) =>
       Effect.gen(function* () {

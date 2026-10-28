@@ -14,6 +14,22 @@ Resonate SDK; this is how this one arranges it. Rationale lives in
 - Outcomes: **Completed**, **Suspended**, **Dropped**. Dropped is not a failure —
   the lease was unclaimable, went stale, or the pass blocked on nothing.
 - Any failure releases the lease rather than making the next worker wait out the ttl.
+- While it drives a task the engine **holds** it on the heartbeat, if there is one:
+  one loop per process, one `task.heartbeat` for every lease held, every ttl/3.
+
+## Around the loop
+
+- **Worker**: the message stream in, `Engine.process` out, one fiber per
+  `execute`, in the worker's scope. `unblock` is received and dropped.
+- **Messages**: server-sent events on `/poll/<group>/<pid>`. Reconnects forever;
+  ends only on 401/403. The server redelivers what nobody took.
+- **Front door**: `Resonate.make` builds every layer once per scope. `run` is
+  `task.create` and drives the lease it comes back with; `rpc` is
+  `promise.create` with a target. Both refuse an id that holds a different call.
+- **Results from outside** are read by polling `promise.get`. A root this process
+  drives wakes its own wait when the drive ends.
+- A root, a child, and a scheduled run carry the same param:
+  `{ func, args, retry, version }`.
 
 ## Pass
 
@@ -39,10 +55,10 @@ Resonate SDK; this is how this one arranges it. Rationale lives in
   not an Error — no stack capture. Matched by `_tag`, never `instanceof`.
 - It unwinds like an exception. Through user frames untouched, inspected at every
   Resonate frame, caught once at the root.
-- Opaque to every combinator over `E` — `catchAll` `catchTag` `either` `option`
-  `match` `merge` `orElse` `retry` `timeout` `Fiber.join`.
-- Visible to every combinator over a `Cause` or `Exit` — `catchAllCause`
-  `catchAllDefect` `sandbox` `Effect.exit` `Fiber.await`. Unavoidable.
+- Opaque to every combinator over `E` — `catch` `catchTag` `result` `option`
+  `match` `orElseSucceed` `retry` `timeout` `Fiber.join`.
+- Visible to every combinator over a `Cause` or `Exit` — `catchCause`
+  `catchDefect` `sandbox` `Effect.exit` `Fiber.await`. Unavoidable.
 - **Nothing rests on that opacity.** The guards carry correctness.
 
 ## What decides
@@ -64,17 +80,16 @@ Resonate SDK; this is how this one arranges it. Rationale lives in
 
 - A frame does not finish while work it spawned is still running.
 - `ctx.run` awaits the body; the body's combinators join what they fork. An
-  `Effect.fork` the body never joins is attached to the fiber, not to any
+  `Effect.forkChild` the body never joins is attached to the fiber, not to any
   combinator — nothing else waits for it.
-- So each frame flushes: after the body, await the fibers *it* added. Not ones
-  the caller already had running, or a frame could wait on a sibling waiting on it.
-- Direct children only. They cover their own subtrees by induction — but only
-  because the body is uninterruptible. Awaiting a fiber does not normally wait
-  for its children; inside an uninterruptible region it does, because a
-  completing fiber interrupts its children and waits for that to land, and
-  deferred interruption turns "interrupt and wait" into "wait until they
-  finish". Coupled: make the body interruptible and this stops reaching past
-  one level.
+- So each frame flushes: after the body, await the fibers *it* added
+  (`Effect.awaitAllChildren`). Not ones the caller already had running, or a
+  frame could wait on a sibling waiting on it.
+- Direct children only. `Effect.all` and `Effect.forEach` forks inherit the
+  body's uninterruptibility, so they run to completion and cover their own
+  subtrees. A bare `forkChild` does not inherit it: when an unjoined fork ends,
+  Effect interrupts the forks *it* never joined, and their work silently does
+  not happen. Pinned by a test. **Join every fork.**
 - The flush runs inside the frame, before its edges merge upward — a fork that
   reaches its edge during the flush records it on that frame.
 - Without it a frame settles over a child still in flight, and a remote one is
@@ -88,19 +103,22 @@ Resonate SDK; this is how this one arranges it. Rationale lives in
 2. **Settle guard.** A frame whose subtree reached an edge does not settle,
    whatever its body returned. Stops a caught block writing a substituted value.
 3. **Divergence check.** A durable write on a path that caught an edge is
-   refused. Per *path* (a `FiberRef`, set on the way to an edge), not per frame —
-   a sibling blocking is not this branch's problem. Runs **after** minting:
-   refusing must consume the same sequence slot the real run would.
-   Its `join` is explicit: poison spreads, never clears. The default is "child
-   wins", which would unpoison a fiber the moment it joined a clean child.
+   refused. Per *fiber* (marked on the way to an edge), not per frame — a sibling
+   blocking is not this branch's problem. Runs **after** minting: refusing must
+   consume the same sequence slot the real run would.
+   Not a context value: Effect 4 restores a fiber's whole context when a provided
+   region exits, which would erase the mark before the catching code reads it.
+   Not spread on join either — Effect 4 has no join hook — so a block swallowed on
+   *another* fiber is not refused. The call check below catches what that mints,
+   on the next pass. Pinned by a test.
 
 ## Borrowed contexts
 
 - A context belongs to the invocation that made it. Using an outer one from
   inside a deeper call advances the outer counter from a place that invocation
   does not order, and no deterministic id exists for it.
-- Each frame records what it is executing, in a `FiberRef` whose `join` keeps the
-  parent's value. A create whose context disagrees is refused.
+- Each frame records what it is executing, in a context reference: forks inherit
+  it, joining never hands it back. A create whose context disagrees is refused.
 - Loud, not fixed. There is no right id to mint.
 
 ## Interruptibility
@@ -130,20 +148,22 @@ Resonate SDK; this is how this one arranges it. Rationale lives in
 - A counter per frame, taken at construction.
 - Stable for any code whose shape does not depend on timing — every concurrent
   combinator included, since branches are built before any of them runs.
-- **Sharp edge**: a call built inside a timing-dependent callback (a `catchAll`
+- **Sharp edge**: a call built inside a timing-dependent callback (a `catch`
   handler, a `forEach` body) while a concurrent branch shares the counter. Replay
   is faster than the first run, callbacks fire in a different order, two branches
   swap ids and read each other's promises. Pin those with `options({ id })`.
-- Every dedup is checked: the encoded param that came back must match the call
-  being made. An id taken twice stops the pass with a diagnostic. It does not make
+- Every dedup is checked, pending or settled: the encoded param that came back
+  must match the call being made. An id taken twice stops the pass with a diagnostic. It does not make
   such a workflow correct — only the explicit id does.
 
 ## Concurrency
 
-- Effect's own. `Effect.all`, `Effect.forEach`, `Effect.fork` + `Fiber.join`.
-- No `begin` variant. Forking a `ctx.rpc` and joining it later already is one.
+- Side by side is `Effect.all` / `Effect.forEach`. Ids in source order, every
+  branch joined.
+- Outliving the invocation is `ctx.detached`.
 - Fire-and-forget `fork` is the one shape durable execution cannot express: the
-  parent would settle over an outstanding promise. **Join your children.**
+  parent would settle over an outstanding promise. The flush is a guard, not a
+  feature, and it reaches one level. **Join every fork.**
 
 ## Race
 

@@ -104,7 +104,7 @@ export const executeUntilBlocked = (
     // And the body runs uninterruptible as a whole, not merely one durable
     // frame at a time. When a branch reaches its edge, Effect interrupts its
     // siblings; a sibling inside a durable frame defers that and finishes, but
-    // one *between* frames — in a `catchAll` handler about to start the
+    // one *between* frames — in a `catch` handler about to start the
     // recovery, in the code after a child returned — has no such cover, and
     // would be cut off there. That loses work the pass could have done, and
     // worse, it silently shifts every id minted after it: the next pass runs

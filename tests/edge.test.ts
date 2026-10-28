@@ -144,8 +144,8 @@ describe("the guards", () => {
 
   it.each([
     ["Effect.exit", (e: Effect.Effect<any, any>) => e.pipe(Effect.exit, Effect.as("substituted"))],
-    ["catchAllCause", (e: Effect.Effect<any, any>) => e.pipe(Effect.catchCause(() => Effect.succeed("substituted")))],
-    ["catchAllDefect", (e: Effect.Effect<any, any>) => e.pipe(Effect.catchDefect(() => Effect.succeed("substituted")))],
+    ["catchCause", (e: Effect.Effect<any, any>) => e.pipe(Effect.catchCause(() => Effect.succeed("substituted")))],
+    ["catchDefect", (e: Effect.Effect<any, any>) => e.pipe(Effect.catchDefect(() => Effect.succeed("substituted")))],
     [
       "sandbox",
       (e: Effect.Effect<any, any>) =>

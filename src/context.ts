@@ -72,18 +72,20 @@ export type Err<F> = F extends (ctx: any, ...args: any[]) => Effect.Effect<any, 
  *
  * Every one of these is a create followed, for the ones that can block, by an
  * await. Creating never blocks; awaiting is what ends a pass. Concurrency is
- * Effect's own — `Effect.all`, `Effect.forEach`, `Effect.fork` + `Fiber.join` —
- * there is no `begin` variant, because forking a `ctx.rpc` and joining it later
- * already is one.
+ * Effect's combinators — `Effect.all` and `Effect.forEach` run calls side by
+ * side, take their ids in source order, and join every branch. Work that
+ * outlives the invocation is `detached`.
  */
 export interface Context extends Info {
   /** Call a function here, durably. Its result is recorded before it returns. */
   run<F extends Workflow>(fn: Registration<F>, ...args: Args<F>): Effect.Effect<Ok<F>, Err<F>>;
+  run<F extends Workflow>(fn: Registration<F>, args: Args<F>, opts: Options): Effect.Effect<Ok<F>, Err<F>>;
   run<A = unknown, E = unknown>(fn: string, ...args: unknown[]): Effect.Effect<A, E>;
   run<A = unknown, E = unknown>(fn: Callable, args: unknown[], opts: Options): Effect.Effect<A, E>;
 
   /** Call a function somewhere else. Awaiting it is what suspends this task. */
   rpc<F extends Workflow>(fn: Registration<F>, ...args: Args<F>): Effect.Effect<Ok<F>, Err<F>>;
+  rpc<F extends Workflow>(fn: Registration<F>, args: Args<F>, opts: Options): Effect.Effect<Ok<F>, Err<F>>;
   rpc<A = unknown, E = unknown>(fn: string, ...args: unknown[]): Effect.Effect<A, E>;
   rpc<A = unknown, E = unknown>(fn: Callable, args: unknown[], opts: Options): Effect.Effect<A, E>;
 
@@ -288,7 +290,7 @@ export const make = (pass: Pass, frame: Frame): Context => {
     Effect.die(
       new Error(
         `ctx.${op} was called after this invocation reached an edge (id=${frame.id}). ` +
-          `Something caught the block — Effect.exit, catchAllCause or catchAllDefect around a ` +
+          `Something caught the block — Effect.exit, catchCause or catchDefect around a ` +
           `durable operation — and kept going on a substituted value. Durable operations must ` +
           `not follow a caught block.`,
       ),
@@ -319,7 +321,7 @@ export const make = (pass: Pass, frame: Frame): Context => {
    *
    * Ids come from a counter per frame, consumed where the call appears. That is
    * stable for code whose shape does not depend on timing — but an operation
-   * built inside a callback that fires at a time-dependent point (a `catchAll`
+   * built inside a callback that fires at a time-dependent point (a `catch`
    * handler, a `forEach` body) takes its number whenever that callback runs,
    * and concurrent branches share the counter. Replay is faster than the first
    * run, because settled children come back from the record instead of doing

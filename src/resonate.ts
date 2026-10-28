@@ -90,6 +90,12 @@ export interface Resonate {
     fn: Registry.Registration<F>,
     ...args: Args<F>
   ): Effect.Effect<Ok<F>, Err<F> | InvocationError>;
+  run<F extends Registry.Workflow>(
+    id: string,
+    fn: Registry.Registration<F>,
+    args: Args<F>,
+    opts: RootOptions,
+  ): Effect.Effect<Ok<F>, Err<F> | InvocationError>;
   run<A = unknown, E = unknown>(
     id: string,
     fn: Callable,
@@ -102,6 +108,12 @@ export interface Resonate {
     id: string,
     fn: Registry.Registration<F>,
     ...args: Args<F>
+  ): Effect.Effect<Ok<F>, Err<F> | InvocationError>;
+  rpc<F extends Registry.Workflow>(
+    id: string,
+    fn: Registry.Registration<F>,
+    args: Args<F>,
+    opts: RootOptions,
   ): Effect.Effect<Ok<F>, Err<F> | InvocationError>;
   rpc<A = unknown, E = unknown>(
     id: string,
